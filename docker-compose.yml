@@ -1,0 +1,23 @@
+services:
+  deep-research:
+    build: .
+    image: deep-research-agent:latest
+    ports:
+      - "8000:8000"
+    environment:
+      # Read these from your shell or a .env file next to this compose file.
+      # docker compose automatically loads .env, which is git-ignored.
+      GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY in .env}
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      SEARCH_PROVIDER: ${SEARCH_PROVIDER:-tavily}
+      MODEL: ${MODEL:-llama-3.3-70b-versatile}
+      MAX_QUESTIONS: ${MAX_QUESTIONS:-5}
+      MAX_REVIEW_CYCLES: ${MAX_REVIEW_CYCLES:-2}
+      CONCURRENCY: ${CONCURRENCY:-4}
+    volumes:
+      # Reports and the search cache outlive the container.
+      - deep-research-data:/data
+    restart: unless-stopped
+
+volumes:
+  deep-research-data:

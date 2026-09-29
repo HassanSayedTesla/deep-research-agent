@@ -1,0 +1,39 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environments
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Runtime output — reports and the search cache are yours, not the repo's
+runs/
+.cache/
+
+# Generated diagrams (rebuild with `deep-research diagram`)
+docs/diagrams/*.html
+lib/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

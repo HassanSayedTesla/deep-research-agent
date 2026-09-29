@@ -1,0 +1,59 @@
+[project]
+name = "deep-research-agent"
+version = "0.1.0"
+description = "A multi-agent deep research system built on LlamaIndex Workflows, with a live flow-graph UI."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "llama-index-core>=0.13.0,<0.15.0",
+    "llama-index-llms-groq>=0.3.0",
+    "llama-index-utils-workflow>=0.3.0",
+    "tavily-python>=0.7.0",
+    "pydantic>=2.9.0",
+    "pydantic-settings>=2.5.0",
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    # TestClient and scripts/smoke.py both talk HTTP directly.
+    "httpx>=0.27.0",
+    "ruff>=0.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/HassanSayedTesla/deep-research-agent"
+Issues = "https://github.com/HassanSayedTesla/deep-research-agent/issues"
+
+[project.scripts]
+deep-research = "deep_research.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deep_research"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]

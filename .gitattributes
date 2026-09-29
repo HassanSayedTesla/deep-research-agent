@@ -1,0 +1,27 @@
+# Normalise line endings in the repository, and keep them native on checkout.
+# Without this, Windows contributors see every file as modified.
+* text=auto eol=lf
+
+*.py    text diff=python
+*.js    text
+*.css   text
+*.html  text
+*.json  text
+*.md    text
+*.toml  text
+*.yml   text
+*.yaml  text
+
+# Binary-ish assets
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.ico   binary
+*.woff  binary
+*.woff2 binary
+
+# Never touch these.
+LICENSE      text eol=lf
+.gitattributes text eol=lf
+.gitignore   text eol=lf
+.dockerignore text eol=lf
