@@ -58,7 +58,7 @@ class FakeLLM:
         # `str` is why that bug reached production: the suite passed while every
         # live call fell back to lenient parsing.
         if not isinstance(prompt, BasePromptTemplate):
-            raise TypeError(
+            raise TypeError(  # noqa: TRY003 - the message is the assertion
                 "astructured_predict needs a PromptTemplate, not "
                 f"{type(prompt).__name__}; wrap it with RichPromptTemplate"
             )

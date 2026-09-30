@@ -326,6 +326,20 @@ async def test_a_runner_built_searcher_is_closed(monkeypatch, settings: Settings
     assert closed == created, "the runner must close exactly the searcher it created"
 
 
+async def test_the_offline_fake_enforces_the_real_prompt_contract():
+    """Guards the guard.
+
+    `FakeLLM` rejecting a bare `str` is what makes the rest of the suite capable
+    of catching the `astructured_predict` bug. If someone relaxes the fake, the
+    suite goes quietly blind to that class of failure, and the only remaining
+    signal is a live run. So the fake's own strictness is asserted directly.
+    """
+    llm = FakeLLM()
+
+    with pytest.raises(TypeError, match="PromptTemplate"):
+        await llm.astructured_predict(ResearchPlan, "a bare string, not a template")
+
+
 async def test_structured_output_uses_a_prompt_template():
     """Regression: a bare `str` made every live plan and verdict fail silently.
 
