@@ -140,6 +140,85 @@ def test_the_default_model_is_the_same_everywhere():
     assert f"`MODEL` | `{DEFAULT_MODEL}`" in readme, "README config table disagrees"
 
 
+def test_streamlit_secrets_map_to_settings(monkeypatch):
+    """Streamlit Cloud secrets must configure the same Settings object.
+
+    The dashboard exposes secrets as a mapping rather than a local `.env`.
+    Unknown dashboard-only keys must be ignored, while secret values must reach
+    validation without being displayed anywhere.
+    """
+    from deep_research.streamlit_config import (
+        missing_configuration,
+        public_configuration,
+        settings_from_secrets,
+    )
+
+    for variable in ("GROQ_API_KEY", "TAVILY_API_KEY", "SERPER_API_KEY"):
+        monkeypatch.delenv(variable, raising=False)
+    base = Settings(_env_file=None, groq_api_key="", search_provider="none")
+
+    configured = settings_from_secrets(
+        {
+            "GROQ_API_KEY": "gsk-test",
+            "deep_research": {
+                "search_provider": "tavily",
+                "tavily_api_key": "tvly-test",
+                "dashboard_only": "ignored",
+            },
+        },
+        base=base,
+    )
+
+    assert configured.groq_api_key == "gsk-test"
+    assert configured.search_provider == "tavily"
+    assert configured.tavily_api_key == "tvly-test"
+    assert missing_configuration(configured) == []
+    public = public_configuration(configured)
+    assert "gsk-test" not in str(public.values())
+    assert "tvly-test" not in str(public.values())
+
+
+def test_streamlit_requirements_cover_runtime_dependencies():
+    """Community Cloud uses requirements.txt, not the local venv.
+
+    If a runtime dependency is missing there, the deployed app fails at import
+    time. This keeps the deployment requirements in lockstep with pyproject.
+    """
+    import re
+    import tomllib
+
+    root = Path(__file__).resolve().parent.parent
+
+    def package_names(lines: list[str]) -> set[str]:
+        names = set()
+        for line in lines:
+            text = line.strip()
+            if text and not text.startswith("#"):
+                names.add(re.split(r"[<>=!~\s\[]", text, maxsplit=1)[0].lower().replace("_", "-"))
+        return names
+
+    requirements = package_names(
+        (root / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    )
+    with (root / "pyproject.toml").open("rb") as handle:
+        project = tomllib.load(handle)["project"]
+    runtime = package_names(project["dependencies"])
+
+    assert "streamlit" in requirements
+    assert runtime <= requirements, (
+        f"missing from requirements.txt: {sorted(runtime - requirements)}"
+    )
+
+
+def test_streamlit_entrypoint_is_valid_python():
+    """The deployment file must at least parse before Cloud tries to run it."""
+    root = Path(__file__).resolve().parent.parent
+    path = root / "streamlit_app.py"
+    source = path.read_text(encoding="utf-8")
+
+    compile(source, str(path), "exec")
+
+
 @pytest.fixture
 def groq_catalogue(monkeypatch):
     """Serve a fake `GET /models` without opening a socket."""

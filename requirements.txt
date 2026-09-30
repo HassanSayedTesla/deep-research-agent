@@ -1,0 +1,12 @@
+streamlit>=1.33
+llama-index-core>=0.13.0,<0.15.0
+llama-index-llms-groq>=0.3.0
+llama-index-utils-workflow>=0.3.0
+tavily-python>=0.7.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+typer>=0.12.0
+rich>=13.7.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+httpx>=0.27.0

@@ -15,6 +15,7 @@ env/
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
 
 # Build artefacts
 build/

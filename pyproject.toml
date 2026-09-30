@@ -26,6 +26,9 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "ruff>=0.7.0",
 ]
+streamlit = [
+    "streamlit>=1.33",
+]
 
 [project.urls]
 Homepage = "https://github.com/HassanSayedTesla/deep-research-agent"
@@ -57,3 +60,4 @@ ignore = ["B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["B011"]
+"streamlit_app.py" = ["E402"]
