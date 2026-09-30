@@ -28,7 +28,7 @@ from .events import (
     RunEvent,
 )
 from .graph import graph_payload
-from .llm import build_llm, check_model_available
+from .llm import LLMGate, build_llm, check_model_available, llm_concurrency_limit
 from .storage import RunMeta, RunStore, new_run_id
 from .tools.web_search import WebSearcher
 from .workflow import RESEARCH_WORKERS, ResearchDeps, build_workflow
@@ -137,6 +137,10 @@ class ResearchRunner:
                 searcher=searcher,
                 settings=self.settings,
                 bridge=self.bridge,
+                # A soft cap on in-flight LLM turns. num_workers still bounds how
+                # many researchers exist; this bounds how many hit the provider at
+                # once, which is a different and much tighter limit.
+                llm_gate=LLMGate(llm_concurrency_limit()),
             )
 
             # Hold the context so the finished run's state can be read back

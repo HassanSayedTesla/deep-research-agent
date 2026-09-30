@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,7 +45,7 @@ from .events import (
     EventBridge,
 )
 from .graph import NODE_BY_ID, parse_node_id
-from .llm import ask_structured
+from .llm import ask_structured, with_rate_limit_retry
 from .prompts import (
     CRITIC_PROMPT,
     PLANNER_PROMPT,
@@ -129,6 +130,19 @@ class ResearchDeps:
     searcher: WebSearcher
     settings: Settings
     bridge: EventBridge
+    llm_gate: Any = None
+
+    def llm_slot(self) -> Any:
+        """An async context manager that paces calls to the LLM.
+
+        `num_workers` bounds how many researchers exist, not how many requests
+        the provider will accept at once. A researcher's turn re-sends the
+        system prompt, the tool schema and any memory, so a handful in flight
+        can exceed a per-minute input-token limit and earn a 429. The gate
+        keeps some parallelism while staying under the budget, and `nullcontext`
+        when unset keeps the workflow usable with an injected fake.
+        """
+        return self.llm_gate if self.llm_gate is not None else nullcontext()
 
     async def node_started(self, node: str, detail: str = "") -> None:
         base, index = parse_node_id(node)
@@ -245,21 +259,31 @@ class DeepResearchWorkflow(Workflow):
 
     @step(num_workers=RESEARCH_WORKERS)
     async def research(self, ctx: Context, ev: QuestionEvent) -> FindingEvent:
-        """One researcher per question. This is the fan-out."""
+        """One researcher per question. This is the fan-out.
+
+        Concurrency is capped by an LLM-wide rate limiter rather than by
+        `num_workers`. Each of these calls re-sends the system prompt, the tool
+        schema and the agent's memory, so four at once can exceed a per-minute
+        *input token* budget even when there is plenty of request headroom. The
+        limiter queues them instead, so a 429 does not end the run.
+        """
         deps: ResearchDeps = await ctx.store.get(DEPS_KEY)
         node = f"research#{ev.index}"
 
         await deps.node_started(node, detail=ev.question)
         await deps.flow("planner", node, "question", preview=_truncate(ev.question, 120))
 
-        result = await deps.research_agent.run(
-            user_msg=(
-                f"Research the answer to this question:\n"
-                f"<question>{ev.question}</question>\n\n"
-                f"Search the web as often as you need. "
-                f"Return only the answer itself, with no preamble and no markdown headings."
+        async with deps.llm_slot():
+            result = await with_rate_limit_retry(
+                lambda: deps.research_agent.run(
+                    user_msg=(
+                        f"Research the answer to this question:\n"
+                        f"<question>{ev.question}</question>\n\n"
+                        f"Search the web as often as you need. "
+                        f"Return only the answer itself, with no preamble and no markdown headings."
+                    )
+                )
             )
-        )
         answer = str(result)
 
         await deps.node_finished(node, summary=_truncate(answer, 140))

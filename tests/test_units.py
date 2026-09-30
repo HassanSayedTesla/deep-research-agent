@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
@@ -38,12 +39,15 @@ from deep_research.graph import (
     worker_node_id,
 )
 from deep_research.llm import (
+    LLMGate,
     ModelUnavailableError,
+    _retry_delay,
     _salvage,
     ask_structured,
     available_models,
     build_llm,
     check_model_available,
+    with_rate_limit_retry,
 )
 from deep_research.prompts import PLANNER_PROMPT
 from deep_research.schemas import ResearchPlan, ReviewVerdict
@@ -324,6 +328,146 @@ async def test_a_runner_built_searcher_is_closed(monkeypatch, settings: Settings
 
     assert created, "expected the runner to build its own searcher"
     assert closed == created, "the runner must close exactly the searcher it created"
+
+
+async def test_the_gate_caps_in_flight_llm_turns():
+    """`num_workers` bounds researchers; this bounds requests to the provider.
+
+    Four researchers each re-send the system prompt, tool schema and memory, so
+    a free-tier 7000 input-token/minute budget only fits about two. The gate is
+    what stops the run earning a 429 on the fan-out.
+    """
+    gate = LLMGate(2)
+    order: list[int] = []
+    overlap = 0
+    active = 0
+
+    async def worker(index: int) -> None:
+        nonlocal overlap, active
+        async with gate:
+            active += 1
+            overlap = max(overlap, active)
+            await asyncio.sleep(0.01)
+            order.append(index)
+            active -= 1
+
+    await asyncio.gather(*(worker(i) for i in range(6)))
+
+    assert sorted(order) == list(range(6)), "every worker must run"
+    assert overlap <= 2, f"at most 2 turns may be in flight, saw {overlap}"
+    assert gate.peak_concurrency == 2
+
+
+async def test_the_gate_is_reusable_across_sequential_batches():
+    gate = LLMGate(1)
+    for _ in range(3):
+        async with gate:
+            await asyncio.sleep(0)
+    assert gate.peak_concurrency == 1
+
+
+async def test_a_rate_limited_call_is_retried_not_fatal():
+    """One unlucky minute must not discard a run that already paid for planning."""
+    from openai import RateLimitError
+
+    calls = 0
+
+    async def flaky() -> str:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise RateLimitError(
+                "Rate limit reached ... Please try again in 0.1s.",
+                response=httpx.Response(429, request=httpx.Request("POST", "https://x")),
+                body=None,
+            )
+        return "recovered"
+
+    result = await with_rate_limit_retry(flaky, attempts=3, base_delay=0.01)
+
+    assert result == "recovered"
+    assert calls == 3
+
+
+async def test_a_rate_limit_gives_up_after_the_attempt_budget():
+    from openai import RateLimitError
+
+    calls = 0
+
+    async def always_limited() -> str:
+        nonlocal calls
+        calls += 1
+        raise RateLimitError(
+            "still limited",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://x")),
+            body=None,
+        )
+
+    with pytest.raises(RateLimitError):
+        await with_rate_limit_retry(always_limited, attempts=2, base_delay=0.01)
+    assert calls == 2
+
+
+async def test_a_non_rate_limit_error_is_not_retried():
+    """Retrying a 400 wastes the budget and hides the real cause."""
+    calls = 0
+
+    async def broken() -> str:
+        nonlocal calls
+        calls += 1
+        raise ValueError("the prompt is malformed")
+
+    with pytest.raises(ValueError, match="malformed"):
+        await with_rate_limit_retry(broken, attempts=3, base_delay=0.01)
+    assert calls == 1
+
+
+def test_the_retry_delay_honours_the_providers_own_suggestion():
+
+    exc = RuntimeError("Rate limit reached ... Please try again in 15.9s.")
+    assert _retry_delay(exc, attempt=0) == pytest.approx(16.9)
+
+    # No hint from the provider: fall back to exponential backoff.
+    assert _retry_delay(RuntimeError("nope"), attempt=2) == 4.0
+    # Never wait absurdly long, however the provider phrases it.
+    assert _retry_delay(RuntimeError("try again in 900s"), attempt=0) == 60.0
+
+
+async def test_researchers_are_paced_by_the_gate(settings: Settings, monkeypatch):
+    """End-to-end proof the fan-out respects the gate, not just the unit test."""
+    from deep_research.workflow import ResearchDeps
+
+    gate = LLMGate(2)
+    deps = ResearchDeps(
+        llm=FakeLLM(),
+        research_agent=ScriptedResearchAgent(),
+        searcher=WebSearcher(settings, client=StubTavilyClient()),
+        settings=settings,
+        bridge=None,  # type: ignore[arg-type]
+        llm_gate=gate,
+    )
+
+    async def one(index: int) -> None:
+        async with deps.llm_slot():
+            await asyncio.sleep(0.01)
+
+    await asyncio.gather(*(one(i) for i in range(8)))
+    assert gate.peak_concurrency <= 2
+
+
+async def test_deps_without_a_gate_still_work(settings: Settings):
+    """An injected fake must not need a limiter to run the pipeline."""
+    from deep_research.workflow import ResearchDeps
+
+    deps = ResearchDeps(
+        llm=FakeLLM(),
+        research_agent=ScriptedResearchAgent(),
+        searcher=WebSearcher(settings, client=StubTavilyClient()),
+        settings=settings,
+        bridge=None,  # type: ignore[arg-type]
+    )
+    async with deps.llm_slot():
+        pass
 
 
 async def test_the_offline_fake_enforces_the_real_prompt_contract():

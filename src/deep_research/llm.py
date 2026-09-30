@@ -13,8 +13,11 @@ one clear line naming the models your key can actually reach.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import re
 from typing import Any, TypeVar
 
 import httpx
@@ -53,6 +56,53 @@ def build_llm(settings: Settings) -> LLM:
     )
 
 
+class LLMGate:
+    """An async context manager that paces concurrent calls to one LLM.
+
+    Fan-out is bounded by `num_workers`, which is a statement about the
+    workflow, not about the provider. Every researcher re-sends the system
+    prompt, the tool schema and its own memory, so four at once can exceed a
+    per-minute *input token* limit and earn a 429 - even with request headroom
+    to spare. Groq's free tier allows 7000 input tokens/minute, and a research
+    turn costs roughly 2.8k, so only two fit.
+
+    The gate keeps a little parallelism (searching is not free) while staying
+    under the budget. It is a soft control: a caller can still blow through it,
+    which is why `retry_on_rate_limit` exists as the backstop.
+    """
+
+    def __init__(self, max_concurrency: int = 2) -> None:
+        self.max_concurrency = max(1, max_concurrency)
+        self._semaphore: asyncio.Semaphore | None = None
+        self.peak_concurrency = 0
+        self._active = 0
+
+    def _get(self) -> asyncio.Semaphore:
+        # Built lazily so the gate is safe to construct outside a loop, and so
+        # each test or run gets a semaphore bound to its own loop.
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrency)
+        return self._semaphore
+
+    async def __aenter__(self) -> LLMGate:
+        await self._get().acquire()
+        self._active += 1
+        self.peak_concurrency = max(self.peak_concurrency, self._active)
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        self._active -= 1
+        self._get().release()
+
+
+def llm_concurrency_limit() -> int:
+    """How many LLM turns may be in flight at once, from the environment."""
+    try:
+        return max(1, min(8, int(os.environ.get("LLM_CONCURRENCY", "2"))))
+    except ValueError:
+        return 2
+
+
 async def available_models(api_key: str) -> list[str]:
     """Model ids this key can reach, sorted. Empty if the listing is refused."""
     headers = {"Authorization": f"Bearer {api_key}"}
@@ -87,6 +137,57 @@ async def check_model_available(settings: Settings) -> str:
     )
 
 
+# Groq says how long to wait, in seconds, inside a 429. Honour it when present
+# rather than guessing, so a retry lands just after the window reopens.
+_RETRY_AFTER = re.compile(r"try again in ([\d.]+)\s*s", re.IGNORECASE)
+
+
+def _retry_delay(exc: Exception, attempt: int) -> float:
+    """Seconds to wait before retrying `exc`."""
+    match = _RETRY_AFTER.search(str(exc))
+    if match:
+        return min(float(match.group(1)) + 1.0, 60.0)
+    return min(2.0**attempt, 30.0)
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    return status == 429 or "RateLimit" in type(exc).__name__ or "rate_limit" in str(exc).lower()
+
+
+async def with_rate_limit_retry(
+    operation: Any,
+    attempts: int = 3,
+    base_delay: float = 2.0,
+) -> Any:
+    """Await `operation()`, retrying a 429 with backoff.
+
+    A rate limit is a transient condition, not a reason to lose a run that has
+    already paid for its planner call and its research fan-out. Without this, one
+    unlucky minute kills the whole pipeline and the report is never written.
+    """
+    last: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return await operation()
+        except Exception as exc:
+            if not _is_rate_limit(exc) or attempt == attempts - 1:
+                raise
+            last = exc
+            delay = _retry_delay(exc, attempt)
+            logger.warning(
+                "rate limited (attempt %d/%d), waiting %.1fs: %s",
+                attempt + 1,
+                attempts,
+                delay,
+                str(exc)[:120],
+            )
+            await asyncio.sleep(delay if delay > base_delay else base_delay * (attempt + 1))
+    if last is not None:  # pragma: no cover - the loop always returns or raises
+        raise last
+    return None
+
+
 async def ask_structured(llm: LLM, output_cls: type[T], prompt: str) -> T | None:
     """Ask the model for an instance of `output_cls`, tolerating a bad reply.
 
@@ -103,12 +204,12 @@ async def ask_structured(llm: LLM, output_cls: type[T], prompt: str) -> T | None
     """
     template = RichPromptTemplate(template_str=prompt)
     try:
-        return await llm.astructured_predict(output_cls, template)
+        return await with_rate_limit_retry(lambda: llm.astructured_predict(output_cls, template))
     except Exception as exc:
         logger.warning("structured predict failed (%s); falling back to plain completion", exc)
 
     try:
-        response = await llm.acomplete(prompt)
+        response = await with_rate_limit_retry(lambda: llm.acomplete(prompt))
     except Exception as exc:
         logger.error("plain completion failed too: %s", exc)
         return None

@@ -41,7 +41,7 @@ def test_save_and_reload_a_run(tmp_path: Path):
     meta = RunMeta(
         run_id="r1",
         topic="Gearboxes",
-        model="llama-3.3-70b-versatile",
+        model="qwen/qwen3.8-27b",
         started_at="2026-09-30T00:00:00+00:00",
         questions=["What is a gearbox?"],
     )

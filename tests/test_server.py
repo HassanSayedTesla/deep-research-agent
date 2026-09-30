@@ -55,7 +55,7 @@ def test_health_reports_the_configuration(client: TestClient):
     payload = client.get("/api/health").json()
 
     assert payload["status"] == "ok"
-    assert payload["model"] == "llama-3.3-70b-versatile"
+    assert payload["model"] == "qwen/qwen3.8-27b"
     assert payload["search_provider"] == "none"
     assert payload["concurrency"] >= 1
 
@@ -114,7 +114,7 @@ def test_the_first_frame_carries_what_the_ui_draws(client: TestClient):
         "writer",
         "critic",
     }
-    assert started["config"]["model"] == "llama-3.3-70b-versatile"
+    assert started["config"]["model"] == "qwen/qwen3.8-27b"
 
 
 def test_the_run_is_archived_and_listed(client: TestClient):
@@ -128,7 +128,7 @@ def test_the_run_is_archived_and_listed(client: TestClient):
     fetched = client.get(f"/api/runs/{done['run_id']}").json()
     # The archive normalises the trailing newline; the stream carries the raw text.
     assert fetched["report"] == done["markdown"] + "\n"
-    assert fetched["meta"]["model"] == "llama-3.3-70b-versatile"
+    assert fetched["meta"]["model"] == "qwen/qwen3.8-27b"
 
 
 def test_unknown_run_is_a_404(client: TestClient):
