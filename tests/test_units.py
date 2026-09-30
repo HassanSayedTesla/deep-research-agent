@@ -470,6 +470,83 @@ async def test_deps_without_a_gate_still_work(settings: Settings):
         pass
 
 
+def test_truncating_a_note_keeps_its_links():
+    """Regression: a hard cut stripped the sources and the report lost its citations.
+
+    A live run produced a 5.7k-character briefing with zero links in it, because
+    `MAX_NOTE_CHARS` cut each note mid-source-list and the writer had nothing
+    left to cite.
+    """
+    from deep_research.workflow import MAX_NOTE_CHARS, _truncate_notes
+
+    note = (
+        "A long analysis. " * 200
+        + " See [the manufacturer](https://example.com/a) and "
+        + "[a standard](https://example.org/b) and [a paper](https://example.net/c)."
+    )
+    assert len(note) > MAX_NOTE_CHARS, "the fixture must actually be long enough to truncate"
+
+    trimmed = _truncate_notes(note)
+
+    assert len(trimmed) > MAX_NOTE_CHARS, "the source list adds to the length"
+    for url in ("https://example.com/a", "https://example.org/b", "https://example.net/c"):
+        assert url in trimmed, f"{url} was lost when the note was truncated"
+
+
+def test_a_short_note_is_untouched():
+    from deep_research.workflow import _truncate_notes
+
+    note = "Short note with [a source](https://example.com/x)."
+    assert _truncate_notes(note) == note
+
+
+async def test_an_unreachable_critic_is_not_recorded_as_approval(monkeypatch, settings: Settings):
+    """The silent-approval trap, closed.
+
+    `ask_structured` returns None when the model cannot be reached. Treating that
+    as "acceptable" shipped a report whose metadata claimed a review that never
+    happened; a live run did exactly that when the verdict call died on an
+    output-token limit.
+    """
+    from deep_research.runner import ResearchRunner
+
+    llm = FakeLLM(plans=[ResearchPlan(questions=["What is the service factor?"])])
+
+    # The critic alone is unreachable; planning and writing still work.
+    real_structured = FakeLLM.astructured_predict
+
+    async def unreachable_critic(self: Any, output_cls: type, prompt: Any, **kwargs: Any) -> Any:
+        if output_cls is ReviewVerdict:
+            raise RuntimeError("provider is down")
+        return await real_structured(self, output_cls, prompt, **kwargs)
+
+    monkeypatch.setattr(FakeLLM, "astructured_predict", unreachable_critic)
+
+    runner = ResearchRunner(
+        "shock loading",
+        settings,
+        llm=llm,
+        searcher=WebSearcher(settings, client=StubTavilyClient()),
+        research_agent=ScriptedResearchAgent(),
+    )
+
+    events = [event async for event in runner.run()]
+    kinds = [event.kind for event in events]
+    assert "report_done" in kinds, "the report should still be delivered"
+
+    result = runner.result
+    assert result is not None
+    assert result.meta.verdict == "critic_unavailable", (
+        f"an unreadable verdict must not be recorded as approval, got {result.meta.verdict!r}"
+    )
+    assert result.meta.review_cycles == 0
+
+    logs = [str(event.data.get("msg", "")) for event in events if event.kind == "log"]
+    assert any("unverified" in message.lower() for message in logs), (
+        "the run should say out loud that the report was not reviewed"
+    )
+
+
 async def test_the_offline_fake_enforces_the_real_prompt_contract():
     """Guards the guard.
 

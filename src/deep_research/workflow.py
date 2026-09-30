@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -174,9 +175,33 @@ def _truncate(text: str, limit: int = MAX_NOTE_CHARS) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + " [...]"
 
 
+def _truncate_notes(text: str, limit: int = MAX_NOTE_CHARS) -> str:
+    """Truncate a research note without dropping the citations.
+
+    A hard cut at `MAX_NOTE_CHARS` was landing in the middle of a source list, so
+    the writer received notes with no links in them and produced a report with
+    zero citations - a research report nobody can check. When a note is cut, the
+    links it contained are appended so the attribution survives the trim.
+    """
+    body = " ".join(str(text).split())
+    if len(body) <= limit:
+        return body
+
+    links = list(dict.fromkeys(re.findall(r"https?://[^\s\)\]]+", body)))
+    trimmed = body[:limit].rstrip()
+    if not links:
+        return trimmed + " [...]"
+
+    kept = [link for link in links if link in trimmed]
+    dropped = [link for link in links if link not in trimmed]
+    tail = ", ".join(dropped) if dropped else ""
+    suffix = f"\n\n[Sources for this note: {', '.join(kept + ([tail] if tail else []))}]"
+    return f"{trimmed} [...]{suffix}"
+
+
 def _format_notes(findings: list[FindingEvent]) -> str:
     blocks = [
-        f"## Question {finding.index + 1}: {finding.question}\n{_truncate(finding.answer)}"
+        f"## Question {finding.index + 1}: {finding.question}\n{_truncate_notes(finding.answer)}"
         for finding in findings
     ]
     return "\n\n".join(blocks)
@@ -346,9 +371,36 @@ class DeepResearchWorkflow(Workflow):
             CRITIC_PROMPT.format(topic=topic, notes=_format_notes(findings), draft=ev.draft),
         )
 
-        # A failed verdict call counts as "no objections raised", never as a crash.
-        acceptable = True if verdict is None else verdict.acceptable
-        feedback = "" if verdict is None else verdict.feedback
+        # A critic that could not be reached is not a critic that approved.
+        #
+        # Treating an unreadable verdict as "acceptable" is the worst option
+        # available: the report ships, the metadata says "approved", and nothing
+        # anywhere records that the review never happened. A live run hit this
+        # when the verdict call died on an output-token limit, and the run
+        # reported a clean approval of a draft that had never been reviewed.
+        #
+        # So an unreadable verdict costs one review cycle and says so out loud.
+        # The loop is already bounded by max_review_cycles, so this cannot
+        # deadlock, and a genuine provider outage is recorded as a failure
+        # instead of being laundered into a green result.
+        if verdict is None:
+            await ctx.store.set("verdict", "critic_unavailable")
+            await deps.node_finished("critic", summary="could not review")
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "The critic could not be reached, so the report is unverified. "
+                    "Treat it as a draft, not a reviewed result."
+                ),
+            )
+            await deps.flow("critic", "writer", "unverified", preview="no verdict")
+            ctx.write_event_to_stream(
+                ProgressEvent(msg="Critic unavailable; report left unverified.")
+            )
+            return StopEvent(result=ev.draft)
+
+        acceptable = verdict.acceptable
+        feedback = verdict.feedback
         exhausted = cycles >= settings.max_review_cycles
 
         if acceptable or exhausted:

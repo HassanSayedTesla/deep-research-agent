@@ -68,9 +68,13 @@ Rules:
 - Use headings and short paragraphs. Use bullets for genuinely enumerable
   items such as options, specs or steps.
 - Where the notes disagree or are thin, say so rather than papering over it.
-- Attribute specific claims to their source when the notes name one.
+- Cite sources inline as markdown links, at the end of the sentence they support:
+  a claim about service factors needs `[what the source says](url)`. The notes
+  carry these links; keep them. A research briefing with no links cannot be
+  checked by the reader, so an uncited report counts as a failed one.
+- Close with a "## Sources" section listing each distinct link you cited.
 - Do not invent facts, figures, citations or sections that the notes do not
-  support.
+  support. Never cite a link the notes did not give you.
 - Aim for substance over length: no filler, no restating the question.
 
 Topic: <topic>{topic}</topic>
