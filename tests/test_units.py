@@ -53,7 +53,7 @@ from deep_research.tools.web_search import (
     WebSearcher,
     build_search_tools,
 )
-from fakes import FakeLLM, StubSerperClient, StubTavilyClient
+from fakes import FakeLLM, ScriptedResearchAgent, StubSerperClient, StubTavilyClient
 
 
 # -- settings --------------------------------------------------------------
@@ -205,6 +205,125 @@ async def test_a_refused_catalogue_never_blocks_a_run(monkeypatch):
     settings = Settings(_env_file=None, groq_api_key="gsk_fake", model="qwen/qwen3.8-27b")
 
     assert await check_model_available(settings) == "qwen/qwen3.8-27b"
+
+
+async def test_the_runner_refuses_to_start_on_a_retired_model(monkeypatch, settings: Settings):
+    """The preflight is the whole point, so prove it stops a run, not just warns.
+
+    Building the LLM and the searcher both cost money or a socket, so the check
+    has to happen before either. Assert the run fails and nothing was started.
+    """
+    from deep_research.runner import ResearchRunner
+
+    async def refuse(*_: Any, **__: Any) -> str:
+        raise ModelUnavailableError("MODEL=llama-3.3-70b-versatile is not available to your Groq key.")
+
+    monkeypatch.setattr("deep_research.runner.check_model_available", refuse)
+
+    settings.model = "llama-3.3-70b-versatile"
+    runner = ResearchRunner("gearbox selection", settings)
+
+    events = [event async for event in runner.run()]
+
+    kinds = [event.kind for event in events]
+    assert "run_failed" in kinds
+    assert "run_started" not in kinds, "the run must not start if the model is gone"
+    failure = next(event for event in events if event.kind == "run_failed")
+    assert "not available" in failure.data.get("error", "")
+
+
+async def test_a_runner_given_an_injected_llm_never_calls_the_network(
+    monkeypatch, settings: Settings
+):
+    """Offline tests inject a fake LLM, so the preflight must stand down for it."""
+    from deep_research.runner import ResearchRunner
+
+    def explode(*_: Any, **__: Any) -> str:
+        raise AssertionError("preflight ran even though a fake LLM was injected")
+
+    monkeypatch.setattr("deep_research.runner.check_model_available", explode)
+
+    runner = ResearchRunner(
+        "gearbox selection",
+        settings,
+        llm=FakeLLM(),
+        searcher=WebSearcher(settings, client=StubTavilyClient()),
+        research_agent=ScriptedResearchAgent(),
+    )
+    events = [event async for event in runner.run()]
+
+    assert "run_failed" not in [event.kind for event in events]
+
+
+async def test_an_injected_searcher_is_left_open_for_its_owner(
+    monkeypatch, settings: Settings
+):
+    """Closing a caller's searcher is a bug the tests never noticed.
+
+    The condition used to be `searcher is self._searcher`, which closed an
+    injected searcher and leaked one the runner had built - exactly backwards.
+    Both directions are asserted here because either one alone passes.
+    """
+    from deep_research.runner import ResearchRunner
+
+    closed: list[bool] = []
+    shared = WebSearcher(settings, client=StubTavilyClient())
+
+    # WebSearcher is a slots dataclass, so the method cannot be swapped on the
+    # instance. Patch the class and match on identity instead.
+    original_close = WebSearcher.aclose
+
+    async def spy(self: WebSearcher) -> None:
+        if self is shared:
+            closed.append(True)
+        await original_close(self)
+
+    monkeypatch.setattr(WebSearcher, "aclose", spy)
+
+    runner = ResearchRunner(
+        "gearbox selection",
+        settings,
+        llm=FakeLLM(),
+        searcher=shared,
+        research_agent=ScriptedResearchAgent(),
+    )
+    async for _ in runner.run():
+        pass
+
+    assert closed == [], "the runner closed a searcher it did not create"
+
+
+async def test_a_runner_built_searcher_is_closed(monkeypatch, settings: Settings):
+    """The other half of the pair: what the runner creates, the runner closes."""
+    from deep_research.runner import ResearchRunner
+
+    created: list[WebSearcher] = []
+    closed: list[WebSearcher] = []
+    real_init = WebSearcher.__init__
+    real_close = WebSearcher.aclose
+
+    def spy_init(self: WebSearcher, *args: Any, **kwargs: Any) -> None:
+        real_init(self, *args, **kwargs)
+        created.append(self)
+
+    async def spy_close(self: WebSearcher) -> None:
+        closed.append(self)
+        await real_close(self)
+
+    monkeypatch.setattr(WebSearcher, "__init__", spy_init)
+    monkeypatch.setattr(WebSearcher, "aclose", spy_close)
+
+    runner = ResearchRunner(
+        "gearbox selection",
+        settings,
+        llm=FakeLLM(),
+        research_agent=ScriptedResearchAgent(),
+    )
+    async for _ in runner.run():
+        pass
+
+    assert created, "expected the runner to build its own searcher"
+    assert closed == created, "the runner must close exactly the searcher it created"
 
 
 async def test_structured_output_uses_a_prompt_template():
