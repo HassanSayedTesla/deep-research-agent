@@ -34,6 +34,16 @@ class Settings(BaseSettings):
         description="Groq model id. Checked against your key's model list before a run starts.",
     )
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    max_output_tokens: int = Field(
+        default=512,
+        ge=64,
+        le=8192,
+        description=(
+            "Ceiling on tokens generated per call. Must sit under the provider's "
+            "per-minute output budget: Groq's free tier allows 1000, and a request "
+            "that asks for more is rejected outright."
+        ),
+    )
 
     # --- Search ------------------------------------------------------------
     tavily_api_key: str = Field(default="", description="API key for Tavily search.")

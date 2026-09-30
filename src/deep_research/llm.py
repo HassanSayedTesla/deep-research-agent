@@ -53,6 +53,17 @@ def build_llm(settings: Settings) -> LLM:
         model=settings.model or DEFAULT_MODEL,
         api_key=settings.groq_api_key,
         temperature=settings.temperature,
+        # A hard output cap, and the single most important number in this
+        # module. Groq's free tier allows 1000 output tokens/minute. Left to
+        # itself the adapter requests far more than that per call, so every
+        # request is rejected with
+        #
+        #   429 Request too large ... OTPM: Limit 1000, Requested 1108
+        #
+        # which no amount of waiting or throttling can fix, because the *next*
+        # request will ask for the same amount. 512 leaves headroom for the
+        # structured-output calls, which also pay for schema tokens.
+        max_tokens=settings.max_output_tokens,
     )
 
 
@@ -98,7 +109,7 @@ class LLMGate:
 def llm_concurrency_limit() -> int:
     """How many LLM turns may be in flight at once, from the environment."""
     try:
-        return max(1, min(8, int(os.environ.get("LLM_CONCURRENCY", "2"))))
+        return max(1, min(8, int(os.environ.get("LLM_CONCURRENCY", "2"))))  # noqa: PLR2004
     except ValueError:
         return 2
 
