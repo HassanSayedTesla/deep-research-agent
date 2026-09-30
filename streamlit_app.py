@@ -46,7 +46,6 @@ from deep_research.runner import ResearchRunner
 from deep_research.storage import RunStore
 from deep_research.streamlit_config import (
     missing_configuration,
-    public_configuration,
     settings_from_secrets,
     settings_with_overrides,
 )
@@ -192,28 +191,12 @@ st.caption(
     "filesystem; download anything worth keeping."
 )
 
-with st.expander("Secrets and configuration", expanded=bool(missing)):
-    st.write(
-        "Set `GROQ_API_KEY` and the key for the selected search provider. "
-        "Values are never displayed by this app."
-    )
-    st.code(
-        'GROQ_API_KEY = "gsk_..."\nTAVILY_API_KEY = "tvly_..."\n# SERPER_API_KEY = "..."',
-        language="toml",
-    )
-    st.json(
-        {
-            "missing": missing,
-            "configuration": public_configuration(settings),
-        }
-    )
-
 run_tab, history_tab = st.tabs(["Run research", "Archived runs"])
 
 with run_tab:
     can_run = len(topic.strip()) >= 3 and not missing
     if missing:
-        st.error(f"Missing configuration: {', '.join(missing)}")
+        st.error("Research cannot run until the required Streamlit secrets are configured.")
     if settings.search_provider == "none":
         st.warning("Web search is disabled; researchers will use model knowledge only.")
 
