@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
+from openai import RateLimitError
 
 from conftest import QUESTIONS, make_settings
 from deep_research.config import Settings
@@ -52,6 +54,67 @@ def make_runner(
         research_agent=agent,
         searcher=searcher,
     )
+
+
+async def test_the_writer_survives_a_provider_outage(
+    settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent, monkeypatch
+):
+    """A dead writer must not discard the research that already succeeded.
+
+    Regression from a live run: the researchers finished in 64s, then the writer
+    hit "TPD: Limit 200000, Used 199383" and the run produced nothing at all.
+    On a free tier that is a routine failure, so the report falls back to the
+    notes themselves - assembled without any model call, which is the only thing
+    that works when the quota is what failed.
+    """
+    calls = {"n": 0}
+
+    async def quota_exhausted(prompt: str, **_: object):
+        calls["n"] += 1
+        raise RateLimitError(
+            "Rate limit reached ... on tokens per day (TPD): Limit 200000, "
+            "Used 199383, Requested 1566.",
+            response=httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com")),
+            body=None,
+        )
+
+    monkeypatch.setattr(llm, "astream_complete", quota_exhausted)
+
+    events, result = await drain(make_runner(settings, llm, agent))
+
+    assert result is not None, "a dead writer should not void the run"
+    assert result.meta.status == "ok"
+    # Assembled locally, so exactly one attempted call and no second chance.
+    assert calls["n"] == 1
+    # The notes survive, in order, under their own questions.
+    for question in QUESTIONS:
+        assert question in result.report
+    assert "Unprocessed research notes" in result.report
+    # And the reader is told what they are looking at.
+    logs = [e.data.get("msg", "") for e in events_of(events, LOG)]
+    assert any("ran out of provider quota" in msg for msg in logs)
+    assert RUN_FAILED not in kinds(events)
+
+
+async def test_a_writer_bug_still_fails_loudly(
+    settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent, monkeypatch
+):
+    """Only quota trouble is absorbed; a real bug must not be hidden.
+
+    Swallowing every writer error would turn a typo into a mysteriously plain
+    report, which is far harder to diagnose than a failed run.
+    """
+
+    async def broken(prompt: str, **_: object):
+        raise TypeError("writer called with the wrong arguments")
+
+    monkeypatch.setattr(llm, "astream_complete", broken)
+
+    events, result = await drain(make_runner(settings, llm, agent))
+
+    assert result is None
+    assert RUN_FAILED in kinds(events)
+    assert "wrong arguments" in events_of(events, RUN_FAILED)[0].data["error"]
 
 
 async def test_one_failing_researcher_does_not_lose_the_run(

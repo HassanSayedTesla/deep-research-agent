@@ -47,7 +47,13 @@ from .events import (
     EventBridge,
 )
 from .graph import NODE_BY_ID, parse_node_id
-from .llm import ask_structured, build_llm, settings_override, with_rate_limit_retry
+from .llm import (
+    _is_rate_limit,
+    ask_structured,
+    build_llm,
+    settings_override,
+    with_rate_limit_retry,
+)
 from .prompts import (
     CRITIC_PROMPT,
     PLANNER_PROMPT,
@@ -169,6 +175,30 @@ class ResearchDeps:
 
     async def log(self, message: str) -> None:
         await self.bridge.emit("log", message=message)
+
+
+def _assemble_report(topic: str, findings: list[FindingEvent]) -> str:
+    """A report built from the findings themselves, with no model call.
+
+    Used when the writer cannot run at all, so the research that already
+    happened is still readable. It is deliberately plainer than the written
+    briefing, and it says so at the top rather than passing itself off as a
+    finished piece. Links are carried through untouched.
+    """
+    lines = [
+        f"# {topic}",
+        "",
+        "> **Unprocessed research notes.** The writing stage could not run, so this "
+        "is the research output assembled directly: accurate and cited, but not "
+        "edited into a briefing.",
+        "",
+    ]
+    for finding in findings:
+        lines.append(f"## {finding.question}")
+        lines.append("")
+        lines.append(finding.answer.strip())
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def _short(exc: BaseException, limit: int = 160) -> str:
@@ -412,15 +442,34 @@ class DeepResearchWorkflow(Workflow):
         ctx.write_event_to_stream(ProgressEvent(msg="Writing the report..."))
 
         prompt = WRITER_PROMPT.format(topic=topic, notes=_format_notes(findings))
-        parts: list[str] = []
-        stream = await deps.llm.astream_complete(prompt)
-        async for chunk in stream:
-            delta = chunk.delta or ""
-            if delta:
-                parts.append(delta)
-                await deps.bridge.emit(REPORT_DELTA, text=delta)
+        try:
+            draft = await self._stream_draft(ctx, deps, prompt)
+        except Exception as exc:
+            if (
+                isinstance(exc, asyncio.CancelledError)
+                or _is_shutdown(exc)
+                or not _is_rate_limit(exc)
+            ):
+                raise
+            # The writer is the last step, and a provider that has run out of
+            # quota will not answer the critic either. Returning nothing throws
+            # away a minute of finished research, so assemble the report from
+            # the notes instead: no LLM call is needed, which is the whole point
+            # when the quota is what failed. A live run lost 64s of research to
+            # "TPD: Limit 200000, Used 199383" at exactly this point.
+            logger.warning("writer could not stream, assembling the report from notes: %s", exc)
+            draft = _assemble_report(topic, findings)
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "The writer ran out of provider quota, so this report is the raw "
+                    "research notes assembled directly rather than a written briefing."
+                ),
+            )
+            ctx.write_event_to_stream(
+                ProgressEvent(msg="Writer unavailable; assembling the report from research notes.")
+            )
 
-        draft = "".join(parts).strip()
         if not draft:  # pragma: no cover - provider-specific failure
             raise RuntimeError("The writer returned an empty report.")
 
@@ -469,6 +518,17 @@ class DeepResearchWorkflow(Workflow):
         await deps.node_finished("writer", summary=f"{len(draft)} characters")
         await deps.flow("writer", "critic", "draft", preview=_truncate(draft, 140))
         return DraftReady(draft=draft)
+
+    async def _stream_draft(self, ctx: Context, deps: ResearchDeps, prompt: str) -> str:
+        """Stream the draft to the browser token by token, and return it whole."""
+        parts: list[str] = []
+        stream = await deps.llm.astream_complete(prompt)
+        async for chunk in stream:
+            delta = chunk.delta or ""
+            if delta:
+                parts.append(delta)
+                await deps.bridge.emit(REPORT_DELTA, text=delta)
+        return "".join(parts).strip()
 
     @step
     async def review(self, ctx: Context, ev: DraftReady) -> StopEvent | RevisionRequest:
