@@ -8,7 +8,10 @@ from typing import Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-SearchProvider = Literal["tavily", "none"]
+SearchProvider = Literal["tavily", "serper", "none"]
+
+# Which environment variable holds the key for each provider.
+SEARCH_KEY_ENV = {"tavily": "TAVILY_API_KEY", "serper": "SERPER_API_KEY"}
 
 
 class Settings(BaseSettings):
@@ -31,9 +34,14 @@ class Settings(BaseSettings):
 
     # --- Search ------------------------------------------------------------
     tavily_api_key: str = Field(default="", description="API key for Tavily search.")
+    serper_api_key: str = Field(default="", description="API key for Google Serper.")
+    serper_base_url: str = Field(
+        default="https://google.serper.dev",
+        description="Serper endpoint. Overridable for a proxy or a self-hosted instance.",
+    )
     search_provider: SearchProvider = Field(
         default="tavily",
-        description="'tavily' for live web search, 'none' to disable the tool.",
+        description="'tavily' or 'serper' for live web search, 'none' to disable the tool.",
     )
     search_max_results: int = Field(default=4, ge=1, le=20)
 
@@ -65,8 +73,19 @@ class Settings(BaseSettings):
             )
 
     def require_search_key(self) -> None:
-        if self.search_provider == "tavily" and not self.tavily_api_key:
+        if self.search_provider == "none":
+            return
+        variable = SEARCH_KEY_ENV[self.search_provider]
+        if not self.api_key_for(self.search_provider):
             raise ValueError(
-                "TAVILY_API_KEY is not set but SEARCH_PROVIDER=tavily. "
-                "Add a key, or set SEARCH_PROVIDER=none to run without web search."
+                f"{variable} is not set but SEARCH_PROVIDER={self.search_provider}. "
+                f"Add a key, or set SEARCH_PROVIDER=none to run without web search."
             )
+
+    def api_key_for(self, provider: str) -> str:
+        """The configured key for `provider`, or an empty string."""
+        if provider == "tavily":
+            return self.tavily_api_key
+        if provider == "serper":
+            return self.serper_api_key
+        return ""

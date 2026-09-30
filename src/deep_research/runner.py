@@ -104,6 +104,7 @@ class ResearchRunner:
     # -- internals ----------------------------------------------------------
     async def _execute(self) -> None:
         started = datetime.now(UTC)
+        searcher: WebSearcher | None = self._searcher
         try:
             self.settings.require_llm_key()
             self.settings.require_search_key()
@@ -152,6 +153,11 @@ class ResearchRunner:
             # usually the only clue about what went wrong.
             await self._archive_failure(message, started, self._context)
         finally:
+            # Release the search provider's connection pool, if it owns one.
+            # Only for a searcher this runner built: an injected one may be
+            # shared, and closing it would be someone else's decision.
+            if searcher is not None and searcher is self._searcher:
+                await searcher.aclose()
             await self.bridge.close()
 
     async def _archive_failure(

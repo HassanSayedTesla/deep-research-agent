@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
 
@@ -9,7 +10,9 @@ import pytest
 from pydantic import ValidationError
 from rich.console import Console
 
+from conftest import make_settings
 from deep_research import cli
+from deep_research.cache import SearchCache
 from deep_research.config import Settings
 from deep_research.events import (
     DONE,
@@ -33,8 +36,13 @@ from deep_research.graph import (
 )
 from deep_research.llm import _salvage, build_llm
 from deep_research.schemas import ResearchPlan, ReviewVerdict
-from deep_research.tools.web_search import WebSearcher, build_search_tools
-from fakes import StubTavilyClient
+from deep_research.tools.web_search import (
+    SearchError,
+    SerperClient,
+    WebSearcher,
+    build_search_tools,
+)
+from fakes import StubSerperClient, StubTavilyClient
 
 
 # -- settings --------------------------------------------------------------
@@ -186,6 +194,260 @@ def test_format_results_collapses_newlines():
     )
 
     assert "a b c" in text
+
+
+# -- serper -----------------------------------------------------------------
+def test_serper_results_are_rendered_from_organic():
+    """Serper calls them `organic` and links them under `link`, not `results`/`url`."""
+    payload = {
+        "searchParameters": {"q": "gearboxes"},
+        "credits": 1,
+        "organic": [
+            {
+                "title": "Load Distribution",
+                "link": "https://sgrgear.example/a",
+                "snippet": "The load is shared.",
+                "date": "Mar 15, 2026",
+                "position": 1,
+            }
+        ],
+    }
+
+    text = WebSearcher.format_serper_results(payload)
+
+    assert "SOURCES:" in text
+    assert "- [Load Distribution](https://sgrgear.example/a) (Mar 15, 2026):" in text
+    assert "The load is shared." in text
+    # Serper has no synthesised answer, so there must not be an empty ANSWER line.
+    assert not text.startswith("ANSWER")
+
+
+def test_serper_results_truncate_long_snippets():
+    payload = {"organic": [{"title": "T", "link": "u", "snippet": "x " * 400}]}
+
+    assert "[...]" in WebSearcher.format_serper_results(payload)
+
+
+def test_serper_results_drop_hits_with_no_link():
+    """A hit that cannot be cited is not worth the tokens."""
+    payload = {
+        "organic": [
+            {"title": "No link", "snippet": "s"},
+            {"title": "Linked", "link": "https://ok.example", "snippet": "s"},
+        ]
+    }
+
+    text = WebSearcher.format_serper_results(payload)
+
+    assert "No link" not in text
+    assert "Linked" in text
+
+
+def test_serper_results_of_an_empty_payload():
+    assert WebSearcher.format_serper_results({}) == "No results found."
+
+
+def test_serper_results_collapses_newlines():
+    text = WebSearcher.format_serper_results(
+        {"organic": [{"title": "T", "link": "u", "snippet": "a\n\nb   c"}]}
+    )
+
+    assert "a b c" in text
+
+
+def test_serper_is_built_when_selected():
+    settings = Settings(
+        groq_api_key="k", serper_api_key="s", search_provider="serper", _env_file=None
+    )
+    searcher = WebSearcher(settings)
+
+    assert isinstance(searcher.client, SerperClient)
+    assert searcher.client.api_key == "s"
+    assert searcher.client.base_url == "https://google.serper.dev"
+
+
+def test_the_serper_base_url_is_overridable():
+    """A proxy or self-hosted instance should not need a code change."""
+    settings = Settings(
+        groq_api_key="k",
+        serper_api_key="s",
+        serper_base_url="https://proxy.internal/serper/",
+        search_provider="serper",
+        _env_file=None,
+    )
+
+    assert WebSearcher(settings).client.base_url == "https://proxy.internal/serper"
+
+
+def test_tavily_is_built_when_selected():
+    settings = Settings(groq_api_key="k", tavily_api_key="t", _env_file=None)
+
+    assert WebSearcher(settings).client is not None
+    assert not isinstance(WebSearcher(settings).client, SerperClient)
+
+
+def test_no_client_is_built_when_search_is_disabled():
+    settings = Settings(groq_api_key="k", search_provider="none", _env_file=None)
+
+    assert WebSearcher(settings).client is None
+
+
+async def test_a_serper_search_passes_the_result_limit(tmp_path: Path):
+    settings = make_settings(tmp_path, search_provider="serper", search_max_results=7)
+    client = StubSerperClient()
+    searcher = WebSearcher(settings, client=client)
+
+    await searcher.search("gearboxes")
+
+    assert client.max_results == [7]
+
+
+async def test_the_cache_does_not_leak_results_across_providers(tmp_path: Path):
+    """Same query, different provider: a Tavily answer must not satisfy Serper."""
+    tavily_settings = make_settings(tmp_path, search_provider="tavily")
+    serper_settings = make_settings(tmp_path, search_provider="serper")
+    # One shared cache file, which is what makes this a real risk.
+    shared = tavily_settings.cache_file
+
+    tavily_client = StubTavilyClient(answer="Tavily says this.")
+    serper_client = StubSerperClient(
+        organic=[{"title": "S", "link": "https://s.example", "snippet": "Serper says this."}]
+    )
+
+    first = await WebSearcher(
+        tavily_settings, client=tavily_client, cache=SearchCache(shared)
+    ).search("same query")
+    second = await WebSearcher(
+        serper_settings, client=serper_client, cache=SearchCache(shared)
+    ).search("same query")
+
+    assert "Tavily says this." in first
+    assert "Serper says this." in second
+    assert len(tavily_client.calls) == 1, "the Tavily call should not have been reused"
+    assert len(serper_client.calls) == 1
+
+
+async def test_the_cache_does_reuse_a_repeated_query_within_a_provider(tmp_path: Path):
+    """The flip side: the cache must still work for the provider that filled it."""
+    settings = make_settings(tmp_path, search_provider="serper")
+    client = StubSerperClient()
+    searcher = WebSearcher(settings, client=client)
+
+    await searcher.search("same query")
+    await searcher.search("same query")
+
+    assert len(client.calls) == 1, "the second identical query should hit the cache"
+    assert searcher.queries == 2
+    assert searcher.calls == 1
+
+
+# -- the Serper HTTP client ------------------------------------------------
+async def test_serper_client_posts_the_documented_request():
+    """Guards the wire format: endpoint, header name, and body keys."""
+    import httpx
+
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["key"] = request.headers.get("X-API-KEY")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"organic": [], "credits": 1})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = SerperClient(api_key="secret", http=http)
+
+    await client.search("gearboxes", max_results=3)
+
+    assert seen["url"] == "https://google.serper.dev/search"
+    assert seen["key"] == "secret", "Serper authenticates with X-API-KEY, not a bearer token"
+    assert seen["body"] == {"q": "gearboxes", "num": 3}
+    await http.aclose()
+
+
+async def test_serper_client_reports_a_rejected_key():
+    import httpx
+
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: httpx.Response(403, json={"message": "Unauthorized."})
+        )
+    )
+    client = SerperClient(api_key="bad", http=http)
+
+    with pytest.raises(SearchError, match="rejected the API key"):
+        await client.search("q")
+    await http.aclose()
+
+
+async def test_serper_client_reports_a_rate_limit_distinctly():
+    import httpx
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(429, json={})))
+    client = SerperClient(api_key="k", http=http)
+
+    with pytest.raises(SearchError, match="rate limit"):
+        await client.search("q")
+    await http.aclose()
+
+
+async def test_serper_client_reports_a_network_failure():
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = SerperClient(api_key="k", http=http)
+
+    with pytest.raises(SearchError, match="serper request failed"):
+        await client.search("q")
+    await http.aclose()
+
+
+async def test_serper_client_does_not_close_an_injected_pool():
+    import httpx
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    client = SerperClient(api_key="k", http=http)
+
+    await client.aclose()
+
+    assert not http.is_closed, "the caller owns a pool it injected"
+
+
+async def test_a_failing_provider_surfaces_as_a_search_error(tmp_path: Path):
+    settings = make_settings(tmp_path, search_provider="serper")
+    searcher = WebSearcher(
+        settings, client=StubSerperClient(fail_with=SearchError("serper is down"))
+    )
+
+    with pytest.raises(SearchError, match="serper is down"):
+        await searcher.search("q")
+
+
+def test_serper_requires_its_own_key(tmp_path):
+    settings = make_settings(tmp_path, tavily_api_key="t", serper_api_key="")
+    settings.search_provider = "serper"
+
+    with pytest.raises(ValueError, match="SERPER_API_KEY"):
+        settings.require_search_key()
+
+
+def test_a_tavily_key_does_not_satisfy_serper(tmp_path):
+    settings = make_settings(tmp_path, tavily_api_key="t", serper_api_key="")
+    settings.search_provider = "serper"
+
+    with pytest.raises(ValueError, match="SERPER_API_KEY"):
+        settings.require_search_key()
+
+
+def test_api_key_for_returns_the_right_key(tmp_path):
+    settings = make_settings(tmp_path, tavily_api_key="t", serper_api_key="s")
+
+    assert settings.api_key_for("tavily") == "t"
+    assert settings.api_key_for("serper") == "s"
+    assert settings.api_key_for("none") == ""
 
 
 async def test_search_with_no_client_answers_from_knowledge():

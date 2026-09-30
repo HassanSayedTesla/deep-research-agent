@@ -119,6 +119,38 @@ class StubTavilyClient:
         return {"answer": self.answer, "results": list(self.results)}
 
 
+@dataclass
+class StubSerperClient:
+    """Returns a canned Serper payload, shaped like the real `/search` response.
+
+    The field names are the ones Serper actually returns (`organic`, `link`,
+    `snippet`) rather than Tavily's, because that difference is the whole
+    reason the parsing is per-provider.
+    """
+
+    organic: list[dict[str, str]] = field(
+        default_factory=lambda: [
+            {
+                "title": "Example",
+                "link": "https://example.com",
+                "snippet": "Body text.",
+                "date": "Mar 15, 2026",
+                "position": 1,
+            }
+        ]
+    )
+    calls: list[str] = field(default_factory=list)
+    max_results: list[int] = field(default_factory=list)
+    fail_with: Exception | None = None
+
+    async def search(self, query: str, **kwargs: Any) -> dict[str, Any]:
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.calls.append(query)
+        self.max_results.append(int(kwargs.get("max_results", 0)))
+        return {"searchParameters": {"q": query}, "organic": list(self.organic), "credits": 1}
+
+
 def extract_question(user_msg: str) -> str:
     """Pull the question out of the prompt the research step builds."""
     start = user_msg.find("<question>")

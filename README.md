@@ -5,6 +5,7 @@ A multi-agent research pipeline on [LlamaIndex Workflows](https://docs.llamainde
 Give it a topic. A planner breaks it into questions, several researchers answer them in parallel, a writer streams a report, and a critic either approves it or sends it back for another round. You watch the whole thing happen in the browser.
 
 - **Provider-agnostic LLM.** Runs on [Groq](https://console.groq.com/) out of the box; the course notebooks used OpenAI.
+- **Two search backends.** Tavily or Google Serper, chosen by one environment variable.
 - **Live visualisation.** Every node activation, every edge, and every draft token is streamed over SSE and animated in SVG. No framework, no build step.
 - **Actually testable.** The entire suite runs offline: the LLM and the search backend are faked, so CI needs no keys and cannot be rate-limited.
 - **Persisted runs.** Every run is archived with its report, metadata and complete event log.
@@ -51,7 +52,7 @@ Get a key at [console.groq.com](https://console.groq.com/keys), add it to `.env`
 
 ```dotenv
 GROQ_API_KEY=gsk_...
-TAVILY_API_KEY=tvly_...   # optional: search falls back to local knowledge
+TAVILY_API_KEY=tvly_...   # or SERPER_API_KEY=... — see "Choosing a search provider"
 ```
 
 Then either start the web UI:
@@ -198,11 +199,13 @@ edit, or set the variables in your shell.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `GROQ_API_KEY` | — | **Required.** The app refuses to start a run without it. |
-| `TAVILY_API_KEY` | — | Optional. Without it, search degrades to model knowledge. |
-| `SEARCH_PROVIDER` | `tavily` | `tavily` or `none`. `none` forces the local-knowledge path. |
+| `TAVILY_API_KEY` | — | Required if `SEARCH_PROVIDER=tavily`. |
+| `SERPER_API_KEY` | — | Required if `SEARCH_PROVIDER=serper`. |
+| `SERPER_BASE_URL` | `https://google.serper.dev` | Override for a proxy or self-hosted Serper. |
+| `SEARCH_PROVIDER` | `tavily` | `tavily`, `serper`, or `none`. `none` forces the local-knowledge path. |
 | `MODEL` | `llama-3.3-70b-versatile` | Any model Groq serves. |
 | `TEMPERATURE` | `0.2` | Low on purpose: this pipeline wants precision, not prose. |
-| `SEARCH_MAX_RESULTS` | `4` | Results per search query, passed through to Tavily. |
+| `SEARCH_MAX_RESULTS` | `4` | Results per search query. |
 | `MAX_QUESTIONS` | `5` | Upper bound the planner is asked to respect. |
 | `MAX_REVIEW_CYCLES` | `2` | How many times the critic can send the work back. |
 | `CONCURRENCY` | `4` | Researchers running at once. Raise it for Groq's rate limit. |
@@ -212,6 +215,32 @@ edit, or set the variables in your shell.
 
 `CONCURRENCY` is read by the workflow at import time rather than through
 `Settings`, because it has to be known before the workflow object exists.
+
+### Choosing a search provider
+
+Both providers sit behind one `web_search` tool, so the agent cannot tell them
+apart. They differ in ways that matter:
+
+| | Tavily | Serper |
+| --- | --- | --- |
+| Built for | agents | Google Search |
+| Synthesised answer | yes, returned alongside sources | no |
+| Result dates | sometimes | usually |
+| Cost | credits per query | credits per query, generally cheaper |
+| Auth | `api_key` on the client | `X-API-KEY` header |
+
+Set the provider and only that provider's key:
+
+```dotenv
+SEARCH_PROVIDER=serper
+SERPER_API_KEY=your-key
+```
+
+The two are not interchangeable behind the scenes — Tavily returns
+`results[].url`/`content`, Serper returns `organic[].link`/`snippet` — so the
+parsing is per-provider rather than duck-typed. The cache key includes the
+provider name, so switching backends never serves you the other one's results
+for the same query.
 
 ---
 
@@ -264,6 +293,7 @@ src/deep_research/
   events.py         the event bridge: one stream, three consumers
   graph.py          the node/edge contract the UI draws
   cache.py          TTL search cache
+  tools/web_search.py  Tavily and Serper clients, normalised into one tool
   storage.py        the run archive
   server.py         FastAPI + SSE
   cli.py            Typer + Rich

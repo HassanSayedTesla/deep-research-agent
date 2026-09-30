@@ -24,6 +24,7 @@ def make_settings(tmp_path: Path, **overrides) -> Settings:
     values = {
         "groq_api_key": "test-key",
         "tavily_api_key": "test-key",
+        "serper_api_key": "test-key",
         "search_provider": "none",
         "runs_dir": tmp_path / "runs",
         "cache_file": tmp_path / "cache.json",

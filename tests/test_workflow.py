@@ -26,7 +26,13 @@ from deep_research.runner import ResearchRunner
 from deep_research.schemas import ResearchPlan, ReviewVerdict
 from deep_research.storage import RunStore
 from deep_research.tools.web_search import WebSearcher
-from fakes import FakeLLM, ScriptedResearchAgent, StubTavilyClient, extract_question
+from fakes import (
+    FakeLLM,
+    ScriptedResearchAgent,
+    StubSerperClient,
+    StubTavilyClient,
+    extract_question,
+)
 from helpers import drain, events_of, kinds
 
 
@@ -243,6 +249,69 @@ async def test_search_results_reach_the_researcher(settings: Settings, llm: Fake
     assert again == result
     assert searcher.calls == 1
     assert searcher.cache.stats()["hits"] == 1
+
+
+async def test_a_serper_backed_run_produces_a_report(tmp_path):
+    """The whole pipeline on the second provider, not just the parsing."""
+    from conftest import make_settings
+
+    settings = make_settings(tmp_path, search_provider="serper")
+    serper = StubSerperClient(
+        organic=[
+            {
+                "title": "Gearbox basics",
+                "link": "https://example.com/gearbox",
+                "snippet": "Gears trade speed for torque.",
+                "date": "Mar 15, 2026",
+            }
+        ]
+    )
+    searcher = WebSearcher(settings, client=serper)
+    llm = FakeLLM(
+        plans=[ResearchPlan(questions=list(QUESTIONS))],
+        reviews=[ReviewVerdict(acceptable=True)],
+    )
+    runner = ResearchRunner(
+        topic="gearbox selection",
+        settings=settings,
+        store=RunStore(settings.runs_dir),
+        llm=llm,
+        research_agent=ScriptedResearchAgent(),
+        searcher=searcher,
+    )
+
+    events, result = await drain(runner)
+
+    assert result is not None
+    assert result.meta.status == "ok"
+    assert result.meta.search_calls == 0, "the faked agent never calls the tool"
+    assert result.meta.cache == searcher.cache.stats()
+    assert DONE in kinds(events)
+
+
+async def test_the_reported_provider_reaches_the_ui(settings: Settings, llm: FakeLLM):
+    """The UI shows which provider ran, so it has to be in the run config."""
+    serper_settings = Settings(
+        groq_api_key="k",
+        serper_api_key="s",
+        search_provider="serper",
+        runs_dir=settings.runs_dir,
+        cache_file=settings.cache_file,
+        _env_file=None,
+    )
+    runner = ResearchRunner(
+        topic="gearboxes",
+        settings=serper_settings,
+        store=RunStore(serper_settings.runs_dir),
+        llm=llm,
+        research_agent=ScriptedResearchAgent(),
+        searcher=WebSearcher(serper_settings, client=StubSerperClient()),
+    )
+
+    events, _ = await drain(runner)
+    started = events_of(events, RUN_STARTED)[0]
+
+    assert started.data["config"]["search_provider"] == "serper"
 
 
 async def test_empty_plan_does_not_deadlock(settings: Settings, agent: ScriptedResearchAgent):
