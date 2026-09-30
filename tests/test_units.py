@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from io import BytesIO, TextIOWrapper
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -59,6 +60,34 @@ def test_settings_reject_an_unknown_search_provider(monkeypatch):
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
+
+
+def test_env_example_matches_the_real_defaults():
+    """Docs drift silently otherwise, and a stale default is a silent bug.
+
+    Every key in .env.example must exist on Settings, and every tunable must
+    agree with the field default.
+    """
+    example = (Path(__file__).resolve().parent.parent / ".env.example").read_text(encoding="utf-8")
+    declared: dict[str, str] = {}
+    for raw in example.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            declared[key.strip()] = value.strip()
+
+    for name, field in Settings.model_fields.items():
+        if name in {"groq_api_key", "tavily_api_key"}:
+            continue
+        assert name.upper() in declared, f"{name} is missing from .env.example"
+        expected = declared[name.upper()]
+        default = field.default
+        if isinstance(default, Path):
+            assert expected == default.as_posix(), name
+        else:
+            assert expected == str(default).lower(), (
+                f"{name}: .env.example says {expected!r}, the default is {default!r}"
+            )
 
 
 def test_missing_llm_key_is_explained():

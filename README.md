@@ -201,12 +201,17 @@ edit, or set the variables in your shell.
 | `TAVILY_API_KEY` | — | Optional. Without it, search degrades to model knowledge. |
 | `SEARCH_PROVIDER` | `tavily` | `tavily` or `none`. `none` forces the local-knowledge path. |
 | `MODEL` | `llama-3.3-70b-versatile` | Any model Groq serves. |
-| `TEMPERATURE` | `0.3` | Low on purpose: this pipeline wants precision, not prose. |
+| `TEMPERATURE` | `0.2` | Low on purpose: this pipeline wants precision, not prose. |
+| `SEARCH_MAX_RESULTS` | `4` | Results per search query, passed through to Tavily. |
 | `MAX_QUESTIONS` | `5` | Upper bound the planner is asked to respect. |
 | `MAX_REVIEW_CYCLES` | `2` | How many times the critic can send the work back. |
 | `CONCURRENCY` | `4` | Researchers running at once. Raise it for Groq's rate limit. |
 | `RUNS_DIR` | `runs` | Where reports are archived. |
 | `CACHE_FILE` | `.cache/search.json` | Search cache. Delete it to force a refresh. |
+| `CACHE_TTL_HOURS` | `24` | How long a cached search result stays fresh. `0` disables reuse. |
+
+`CONCURRENCY` is read by the workflow at import time rather than through
+`Settings`, because it has to be known before the workflow object exists.
 
 ---
 
