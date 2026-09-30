@@ -55,6 +55,12 @@ Rules:
   sources agree before you state a contested fact.
 - Prefer specifics: numbers, dates, names, mechanisms.
 - State plainly when the evidence is thin or the sources disagree.
+- Keep the source links. Write each claim as `text ([what the source says](url))`
+  using the URLs the tool returned. This is the part that matters most: your
+  answer is the only place the writer can learn where the evidence came from, so
+  an answer without links becomes a report nobody can check. A live run produced
+  a 2,500-character briefing with zero citations because every researcher
+  dropped its links.
 - Reply with the answer only. No preamble, no headings, no markdown."""
 
 WRITER_PROMPT = """You are the writing stage of an automated deep-research system.

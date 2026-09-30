@@ -109,7 +109,7 @@ class LLMGate:
 def llm_concurrency_limit() -> int:
     """How many LLM turns may be in flight at once, from the environment."""
     try:
-        return max(1, min(8, int(os.environ.get("LLM_CONCURRENCY", "2"))))  # noqa: PLR2004
+        return max(1, min(8, int(os.environ.get("LLM_CONCURRENCY", "2"))))
     except ValueError:
         return 2
 
@@ -271,6 +271,16 @@ def _salvage(text: str, output_cls: type[T]) -> T | None:
 
     logger.warning("could not parse a %s out of the model reply", output_cls.__name__)
     return None
+
+
+def settings_override(settings: Settings, **changes: Any) -> Settings:
+    """A copy of `settings` with `changes` applied.
+
+    Used where one call needs a different budget from the rest of the run, e.g.
+    the writer retrying at a larger `max_tokens`. Copying keeps the change local:
+    a shared object would silently raise the cap for every later call too.
+    """
+    return settings.model_copy(update=changes)
 
 
 async def complete_text(llm: LLM, prompt: str) -> str:

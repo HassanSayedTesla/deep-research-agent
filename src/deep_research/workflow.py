@@ -46,7 +46,7 @@ from .events import (
     EventBridge,
 )
 from .graph import NODE_BY_ID, parse_node_id
-from .llm import ask_structured, with_rate_limit_retry
+from .llm import ask_structured, build_llm, settings_override, with_rate_limit_retry
 from .prompts import (
     CRITIC_PROMPT,
     PLANNER_PROMPT,
@@ -168,6 +168,29 @@ class ResearchDeps:
 
     async def log(self, message: str) -> None:
         await self.bridge.emit("log", message=message)
+
+
+def _looks_truncated(text: str) -> bool:
+    """Does this draft stop because it ran out of tokens rather than finished?
+
+    A model cut off by a `max_tokens` cap leaves a hard signal: the text ends
+    without closing the markdown construct it was in. A finished report ends
+    with punctuation. Guessing from length alone would misfire, so this only
+    reports a cut when the evidence is there, and the caller retries once.
+    """
+    stripped = text.rstrip()
+    if not stripped:
+        return True
+    if stripped[-1] in ".!?:;`)]}\"'":
+        return False
+    # Unclosed bold, a dangling code fence, or a cut mid-heading.
+    if stripped.count("**") % 2 == 1:
+        return True
+    if stripped.count("```") % 2 == 1:
+        return True
+    if stripped.rsplit("\n", 1)[-1].startswith("#"):
+        return True
+    return True
 
 
 def _truncate(text: str, limit: int = MAX_NOTE_CHARS) -> str:
@@ -349,6 +372,48 @@ class DeepResearchWorkflow(Workflow):
         draft = "".join(parts).strip()
         if not draft:  # pragma: no cover - provider-specific failure
             raise RuntimeError("The writer returned an empty report.")
+
+        # The provider's per-minute output budget forces a token cap, and a
+        # report longer than that cap comes back mid-word. A live run produced
+        # "...18CrNiMo" as the last characters of a "finished" report. Rather
+        # than ship a truncated document, detect it and retry once at a larger
+        # allowance, which is affordable because this is the last big call.
+        if _looks_truncated(draft) and not await ctx.store.get("writer_retried", False):
+            await ctx.store.set("writer_retried", True)
+            bigger = min(deps.settings.max_output_tokens * 3, 2048)
+            logger.info(
+                "draft looks truncated at the %d-token cap; retrying the writer at %d",
+                deps.settings.max_output_tokens,
+                bigger,
+            )
+            ctx.write_event_to_stream(
+                ProgressEvent(msg="Draft hit the output cap; retrying with more room...")
+            )
+            await deps.bridge.emit(
+                "log", msg=f"Draft was cut off at the output cap; retrying at {bigger} tokens."
+            )
+            retry = build_llm(settings_override(deps.settings, max_output_tokens=bigger))
+            retry_parts: list[str] = []
+            retry_stream = await retry.astream_complete(prompt)
+            async for chunk in retry_stream:
+                delta = chunk.delta or ""
+                if delta:
+                    retry_parts.append(delta)
+                    await deps.bridge.emit(REPORT_DELTA, text=delta)
+            longer = "".join(retry_parts).strip()
+            if len(longer) > len(draft):
+                draft = longer
+
+        if _looks_truncated(draft):
+            # Still short after the retry: say so rather than implying the
+            # report is complete, and let the critic weigh it.
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "The report is still truncated at the provider's output cap. "
+                    "Raise MAX_OUTPUT_TOKENS on a paid tier, or lower MAX_QUESTIONS."
+                ),
+            )
 
         await deps.node_finished("writer", summary=f"{len(draft)} characters")
         await deps.flow("writer", "critic", "draft", preview=_truncate(draft, 140))
