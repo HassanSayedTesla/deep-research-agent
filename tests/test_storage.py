@@ -33,7 +33,24 @@ def test_slugify_is_length_bounded():
 
 def test_run_id_is_timestamp_prefixed_and_slugged():
     run_id = new_run_id("Gearbox Selection", now=datetime(2026, 9, 30, 14, 12, 33))
-    assert run_id == "20260930-141233-gearbox-selection"
+    assert run_id == "20260930-141233-000000-gearbox-selection"
+
+
+def test_two_runs_in_the_same_second_get_different_ids():
+    """A double-click, or two browser tabs, must not share a directory.
+
+    The id was to the second, so both runs resolved to the same directory and
+    overwrote each other's `report.md`, `meta.json` and `events.jsonl` - with
+    only one of the two then appearing in the run list.
+    """
+    moment = datetime(2026, 9, 30, 14, 12, 33)
+    first = new_run_id("Gearboxes", now=moment)
+    second = new_run_id("Gearboxes", now=moment.replace(microsecond=1))
+
+    assert first != second
+    # And the readable prefix is unchanged.
+    assert first.startswith("20260930-141233-")
+    assert first.endswith("-gearboxes")
 
 
 def test_save_and_reload_a_run(tmp_path: Path):

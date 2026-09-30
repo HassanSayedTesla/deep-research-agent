@@ -31,6 +31,7 @@ import asyncio
 import logging
 import os
 import re
+from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
@@ -38,6 +39,7 @@ from typing import Any
 from llama_index.core.llms import LLM
 from llama_index.core.workflow import Context, Event, StartEvent, StopEvent, Workflow, step
 
+from .agents import build_research_agent
 from .config import Settings
 from .events import (
     EDGE_FLOW,
@@ -48,9 +50,9 @@ from .events import (
 )
 from .graph import NODE_BY_ID, parse_node_id
 from .llm import (
-    _is_rate_limit,
     ask_structured,
     build_llm,
+    is_quota_error,
     settings_override,
     with_rate_limit_retry,
 )
@@ -134,11 +136,17 @@ class ResearchDeps:
     """Everything a run needs, passed in rather than built inside the workflow."""
 
     llm: LLM
-    research_agent: Any
     searcher: WebSearcher
     settings: Settings
     bridge: EventBridge
+    # A prebuilt agent, shared across questions. Only tests inject one; the
+    # factory below is how each researcher gets its own search allowance.
+    research_agent: Any = None
     llm_gate: Any = None
+    # Builds the agent for question `index`. When set, it wins over
+    # `research_agent`, which is what lets `runner` give each researcher its own
+    # search allowance.
+    research_agent_factory: Callable[[int], Any] | None = None
 
     def llm_slot(self) -> Any:
         """An async context manager that paces calls to the LLM.
@@ -151,6 +159,23 @@ class ResearchDeps:
         when unset keeps the workflow usable with an injected fake.
         """
         return self.llm_gate if self.llm_gate is not None else nullcontext()
+
+    def research_agent_for(self, index: int) -> Any:
+        """The agent that answers question `index`, with its own search allowance.
+
+        Preference order:
+
+        1. an injected factory, which is how `runner` gets one agent per question;
+        2. a prebuilt `research_agent`, which is how tests inject a fake - it is
+           shared, so it also shares one search allowance;
+        3. otherwise a real agent built per question over the shared LLM and a
+           per-researcher view of the searcher.
+        """
+        if self.research_agent_factory is not None:
+            return self.research_agent_factory(index)
+        if self.research_agent is not None:
+            return self.research_agent
+        return build_research_agent(self.llm, self.searcher.for_agent())
 
     async def node_started(self, node: str, detail: str = "") -> None:
         base, index = parse_node_id(node)
@@ -212,11 +237,55 @@ def _short(exc: BaseException, limit: int = 160) -> str:
 
 
 def _is_shutdown(exc: BaseException) -> bool:
-    """Is this a cancellation rather than a genuine research failure?"""
+    """Is this a cancellation rather than a genuine research failure?
+
+    Importing `WorkflowCancelledByUser` is not an option: `workflows` is an
+    optional dependency of this package, and this module must import without it.
+    So the check is by class name. It has to name the *real* class - the
+    original list contained a `WorkflowCancelledError` that does not exist, so
+    a user pressing "stop" was treated as a failed researcher: the run carried
+    on, logged "continuing without it", and stood a fabricated "could not be
+    researched" finding in place of the cancelled question.
+    """
     if isinstance(exc, asyncio.CancelledError):
         return True
-    name = type(exc).__name__
-    return name in {"WorkflowCancelledError", "CancelledError", "GeneratorExit"}
+    return type(exc).__name__ in {
+        "WorkflowCancelledByUser",
+        "WorkflowCancelledError",
+        "CancelledError",
+        "GeneratorExit",
+    }
+
+
+def _larger_draft_budget(settings: Settings) -> int:
+    """A bigger output allowance to retry a truncated draft with.
+
+    Tripling looked generous and was in fact impossible on a free tier: a live run
+    set `MAX_OUTPUT_TOKENS=512`, the retry asked for 1536, and Groq refused with
+    `OTPM: Limit 1000, Requested 130` - the request itself is over the ceiling, so
+    waiting can never help. Asking for more than the provider will ever grant
+    turns a recoverable truncation into an unconditional fallback to raw notes.
+
+    So the retry is clamped to what the provider will actually grant, so that a
+    recoverable truncation does not turn into an unconditional fallback.
+    """
+    ceiling = settings.max_output_ceiling
+    wanted = settings.max_output_tokens * 3
+    return min(wanted, 2048, ceiling)
+
+
+def _hit_length_cap(chunk: Any) -> bool:
+    """Did the provider stop generating because it ran out of output tokens?
+
+    This is the authoritative truncation signal. The provider sets
+    `finish_reason="length"` when it stops at `max_tokens`, so the caller never
+    has to infer it from the shape of the text. Inferring it is what made a
+    report ending in a bullet or a closing `**` look cut off, and a wrong
+    guess costs a second provider call on a quota that may already be spent.
+    """
+    raw = getattr(chunk, "raw", None)
+    choices = getattr(raw, "choices", None) or ()
+    return any(getattr(choice, "finish_reason", None) == "length" for choice in choices)
 
 
 def _looks_truncated(text: str) -> bool:
@@ -226,6 +295,12 @@ def _looks_truncated(text: str) -> bool:
     without closing the markdown construct it was in. A finished report ends
     with punctuation. Guessing from length alone would misfire, so this only
     reports a cut when the evidence is there, and the caller retries once.
+
+    The default is "finished". Ending on a bare word, a bullet, a closing
+    `**`, a URL or a full-width character is all normal for a report, and
+    treating any of those as a cut costs a wasted retry on essentially every
+    real document - and, because the retry is another provider call, it costs a
+    wasted call on a quota that may already be gone.
     """
     stripped = text.rstrip()
     if not stripped:
@@ -239,7 +314,7 @@ def _looks_truncated(text: str) -> bool:
         return True
     if stripped.rsplit("\n", 1)[-1].startswith("#"):
         return True
-    return True
+    return False
 
 
 def _truncate(text: str, limit: int = MAX_NOTE_CHARS) -> str:
@@ -339,6 +414,21 @@ class DeepResearchWorkflow(Workflow):
             )
 
         plan = await ask_structured(deps.llm, ResearchPlan, prompt)
+        # `ask_structured` returns None on a quota refusal as well as on bad
+        # JSON, and those two are nothing alike to the user. Falling through to
+        # the single generic question in `_clean_questions` used to make an
+        # exhausted daily budget look like a successful, merely-thinner report.
+        # The critic path already reports an unusable verdict this way; the
+        # planner must not be the one place that degrades silently.
+        if plan is None:
+            logger.warning("the planner returned nothing; using one generic question")
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "The planner could not be reached, so this run is using a single "
+                    "generic question instead of a researched breakdown of the topic."
+                ),
+            )
         questions = _clean_questions(plan.questions if plan else [], topic, settings.max_questions)
 
         # The writer blocks until it has collected this many findings, so the
@@ -371,9 +461,17 @@ class DeepResearchWorkflow(Workflow):
         await deps.flow("planner", node, "question", preview=_truncate(ev.question, 120))
 
         try:
+            # A fresh agent per question, so each researcher gets its own search
+            # allowance (`searcher.for_agent`). Sharing one agent meant one
+            # shared search budget, and in a live run a researcher that looped to
+            # its iteration cap spent the whole run's allowance: its sibling was
+            # told the budget was gone having retrieved nothing, wrote a finding
+            # from memory, and the writer cited it as research. The provider
+            # client, cache and run-wide ceiling stay shared either way.
+            agent = deps.research_agent_for(ev.index)
             async with deps.llm_slot():
                 result = await with_rate_limit_retry(
-                    lambda: deps.research_agent.run(
+                    lambda: agent.run(
                         user_msg=(
                             f"Research the answer to this question:\n"
                             f"<question>{ev.question}</question>\n\n"
@@ -400,12 +498,32 @@ class DeepResearchWorkflow(Workflow):
             # rather than disappearing behind an exception. Errors that look like
             # cancellation (the client hanging up, the run shutting down) are
             # re-raised so shutdown stays prompt.
-            if isinstance(exc, asyncio.CancelledError) or _is_shutdown(exc):
+            if _is_shutdown(exc):
                 raise
             logger.warning("researcher %s failed, continuing without it: %s", ev.index, exc)
+            # The finding goes to the writer and ends up in the report, so it must
+            # not carry the provider's raw error body. A live run put the whole
+            # thing in the finished document:
+            #
+            #   This question could not be researched: Error code: 429 - {'error':
+            #   {'message': 'Rate limit reached for model `qwen/qwen3.8-27b` in
+            #   organization `org_01ksmg...` service tier `on_demand` on input
+            #   tokens per minute (ITPM): Limit 7000, Used 6227, ...
+            #
+            # Truncating it was not enough: the first 90 characters still carried
+            # the account id. So the note says what kind of failure it was and
+            # nothing else - the reader needs to know the question went unanswered
+            # and that nothing in it is verified. The detail belongs in the log,
+            # where `logger.warning` above already recorded all of it.
+            reason = (
+                "the provider's quota was exhausted"
+                if is_quota_error(exc)
+                else f"the provider returned {type(exc).__name__}"
+            )
             answer = (
-                f"This question could not be researched: {exc}. "
-                f"Answer from your own knowledge, and mark the whole point as unverified."
+                f"This question could not be researched: {reason}. Treat the whole "
+                "point as unverified, answer from your own knowledge if you can, and "
+                "do not present it as sourced."
             )
             await deps.bridge.emit(
                 "log",
@@ -445,11 +563,7 @@ class DeepResearchWorkflow(Workflow):
         try:
             draft = await self._stream_draft(ctx, deps, prompt)
         except Exception as exc:
-            if (
-                isinstance(exc, asyncio.CancelledError)
-                or _is_shutdown(exc)
-                or not _is_rate_limit(exc)
-            ):
+            if _is_shutdown(exc) or not is_quota_error(exc):
                 raise
             # The writer is the last step, and a provider that has run out of
             # quota will not answer the critic either. Returning nothing throws
@@ -459,6 +573,7 @@ class DeepResearchWorkflow(Workflow):
             # "TPD: Limit 200000, Used 199383" at exactly this point.
             logger.warning("writer could not stream, assembling the report from notes: %s", exc)
             draft = _assemble_report(topic, findings)
+            await ctx.store.set("writer_degraded", True)
             await deps.bridge.emit(
                 "log",
                 msg=(
@@ -478,11 +593,21 @@ class DeepResearchWorkflow(Workflow):
         # "...18CrNiMo" as the last characters of a "finished" report. Rather
         # than ship a truncated document, detect it and retry once at a larger
         # allowance, which is affordable because this is the last big call.
-        if _looks_truncated(draft) and not await ctx.store.get("writer_retried", False):
+        #
+        # Not when the draft is already the assembled-notes fallback, though:
+        # that text ends wherever the last finding ended, so it trips the
+        # truncation check every time, and retrying means another call to a
+        # provider that has already said no. A live run fell back to the notes
+        # and then died retrying, throwing away the report it had just built.
+        degraded: bool = await ctx.store.get("writer_degraded", False)
+        # The provider's own `finish_reason` wins when it is available; the
+        # text shape is only a fallback for providers that do not report it.
+        capped: bool = await ctx.store.get("writer_hit_cap", False) or _looks_truncated(draft)
+        if not degraded and capped and not await ctx.store.get("writer_retried", False):
             await ctx.store.set("writer_retried", True)
-            bigger = min(deps.settings.max_output_tokens * 3, 2048)
+            bigger = _larger_draft_budget(deps.settings)
             logger.info(
-                "draft looks truncated at the %d-token cap; retrying the writer at %d",
+                "draft hit the %d-token cap; retrying the writer at %d",
                 deps.settings.max_output_tokens,
                 bigger,
             )
@@ -494,24 +619,71 @@ class DeepResearchWorkflow(Workflow):
             )
             retry = build_llm(settings_override(deps.settings, max_output_tokens=bigger))
             retry_parts: list[str] = []
-            retry_stream = await retry.astream_complete(prompt)
-            async for chunk in retry_stream:
-                delta = chunk.delta or ""
-                if delta:
-                    retry_parts.append(delta)
-                    await deps.bridge.emit(REPORT_DELTA, text=delta)
-            longer = "".join(retry_parts).strip()
-            if len(longer) > len(draft):
-                draft = longer
 
-        if _looks_truncated(draft):
-            # Still short after the retry: say so rather than implying the
-            # report is complete, and let the critic weigh it.
+            async def retry_attempt() -> str:
+                # Same discipline as the first draft: this stream is on screen
+                # too, so a refusal part-way through keeps what arrived instead
+                # of retrying and appending a second copy of the report.
+                stream = await retry.astream_complete(prompt)
+                local: list[str] = []
+                try:
+                    async for chunk in stream:
+                        delta = chunk.delta or ""
+                        if delta:
+                            local.append(delta)
+                            await deps.bridge.emit(REPORT_DELTA, text=delta)
+                        if _hit_length_cap(chunk):
+                            await ctx.store.set("writer_hit_cap", True)
+                            break
+                finally:
+                    retry_parts[:] = local
+                return "".join(local).strip()
+
+            try:
+                longer = await with_rate_limit_retry(
+                    retry_attempt,
+                    should_retry=lambda _exc: not retry_parts,
+                )
+                # Always prefer the retry. The first draft is *known* to have
+                # been cut off at the cap, so it is the worse artifact even when
+                # it happens to contain more characters. Keeping it only if the
+                # retry was longer shipped a report ending mid-word, and then
+                # blamed the token cap for it.
+                if longer:
+                    draft = longer
+            except Exception as exc:
+                if _is_shutdown(exc) or not is_quota_error(exc):
+                    raise
+                # The retry itself failed because of quota, so fall back to notes.
+                logger.warning("writer retry failed, assembling the report from notes: %s", exc)
+                draft = _assemble_report(topic, findings)
+                await ctx.store.set("writer_degraded", True)
+                await deps.bridge.emit(
+                    "log",
+                    msg=(
+                        "The writer ran out of provider quota while retrying; this "
+                        "report is the raw research notes assembled directly."
+                    ),
+                )
+
+        # L1: only blame the token cap when the cap is what actually stopped the
+        # writer. Reporting a healthy report as truncated - and advising the
+        # operator to raise a limit that was never the problem - is worse than
+        # saying nothing, and a degraded draft is a different failure entirely.
+        if await ctx.store.get("writer_hit_cap", False):
             await deps.bridge.emit(
                 "log",
                 msg=(
                     "The report is still truncated at the provider's output cap. "
                     "Raise MAX_OUTPUT_TOKENS on a paid tier, or lower MAX_QUESTIONS."
+                ),
+            )
+        elif degraded:
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "This report is the raw research notes: the writer had no quota "
+                    "left to write them up, so it is unedited and unverified."
                 ),
             )
 
@@ -520,15 +692,60 @@ class DeepResearchWorkflow(Workflow):
         return DraftReady(draft=draft)
 
     async def _stream_draft(self, ctx: Context, deps: ResearchDeps, prompt: str) -> str:
-        """Stream the draft to the browser token by token, and return it whole."""
+        """Stream the draft to the browser token by token, and return it whole.
+
+        The only provider call in the pipeline that was not routed through
+        `with_rate_limit_retry`, and a live run showed why that mattered: the
+        writer was refused with `OTPM: Limit 1000 ... Please try again in 5.94s`
+        - a six-second wait - and the caller treated it as terminal, so the run
+        degraded to raw research notes. Every other call would have waited.
+
+        Retrying is only safe while nothing has been streamed: once tokens have
+        reached the browser, a retry would append a second draft to the first
+        one. A mid-stream refusal therefore keeps what was written and stops,
+        rather than duplicating the report.
+        """
         parts: list[str] = []
-        stream = await deps.llm.astream_complete(prompt)
-        async for chunk in stream:
-            delta = chunk.delta or ""
-            if delta:
-                parts.append(delta)
-                await deps.bridge.emit(REPORT_DELTA, text=delta)
-        return "".join(parts).strip()
+
+        async def attempt() -> str:
+            stream = await deps.llm.astream_complete(prompt)
+            local: list[str] = []
+            try:
+                async for chunk in stream:
+                    delta = chunk.delta or ""
+                    if delta:
+                        local.append(delta)
+                        await deps.bridge.emit(REPORT_DELTA, text=delta)
+                    if _hit_length_cap(chunk):
+                        # The provider told us it stopped at `max_tokens`, so no
+                        # further chunk can carry content. Recorded for the retry
+                        # decision, which asks for a larger allowance.
+                        await ctx.store.set("writer_hit_cap", True)
+                        break
+            finally:
+                # Whatever arrived is real output, even if the stream then failed.
+                # Without this, a refusal part-way through raised with `parts`
+                # still empty, and the text the browser had already been sent was
+                # thrown away in favour of a hard failure.
+                parts[:] = local
+            return "".join(local).strip()
+
+        try:
+            # `should_retry` is what makes the docstring's promise true: once a
+            # token has reached the browser, a retry would append a second draft
+            # to the first, so the refusal is handed back as a partial instead.
+            return await with_rate_limit_retry(attempt, should_retry=lambda _exc: not parts)
+        except Exception as exc:
+            if not parts or _is_shutdown(exc):
+                raise
+            # Tokens are already on the screen, so this is a partial draft and
+            # not a failure to retry. Hand back what arrived.
+            logger.warning(
+                "writer stream failed after %d characters (%s); keeping the partial draft",
+                len("".join(parts)),
+                exc,
+            )
+            return "".join(parts).strip()
 
     @step
     async def review(self, ctx: Context, ev: DraftReady) -> StopEvent | RevisionRequest:
@@ -578,6 +795,7 @@ class DeepResearchWorkflow(Workflow):
         acceptable = verdict.acceptable
         feedback = verdict.feedback
         exhausted = cycles >= settings.max_review_cycles
+        degraded: bool = await ctx.store.get("writer_degraded", False)
 
         if acceptable or exhausted:
             reason = "approved" if acceptable else "out of review cycles"
@@ -585,6 +803,31 @@ class DeepResearchWorkflow(Workflow):
             await deps.flow("critic", "writer", "accepted", preview=topic)
             await ctx.store.set("verdict", "acceptable" if acceptable else "cycle_limit")
             ctx.write_event_to_stream(ProgressEvent(msg=f"Report {reason}."))
+            return StopEvent(result=ev.draft)
+
+        if degraded:
+            # A revision cannot fix this. The draft fell back to the raw notes
+            # because the writer hit a quota, so sending it back re-runs the
+            # research and the writer and lands in exactly the same wall. A live
+            # run did precisely that, spending the remaining 800 seconds of a
+            # 900-second budget on a second round that had no way to succeed.
+            # The critic's feedback is still worth keeping; the report is still
+            # worth returning, clearly labelled as unreviewed-and-improvable.
+            await deps.node_finished("critic", summary="changes wanted, but no budget to act")
+            await ctx.store.set("verdict", "unverified")
+            await ctx.store.set("reviewer_feedback", feedback)
+            await deps.flow("critic", "writer", "unverified", preview=_truncate(feedback, 200))
+            await deps.bridge.emit(
+                "log",
+                msg=(
+                    "The critic asked for changes, but the writer had already fallen "
+                    "back to the raw notes, so a revision would hit the same limit. "
+                    "Returning the notes with the feedback attached."
+                ),
+            )
+            ctx.write_event_to_stream(
+                ProgressEvent(msg="Changes wanted, but out of provider budget; stopping here.")
+            )
             return StopEvent(result=ev.draft)
 
         # Recorded only when the critic actually asked for changes, so

@@ -44,6 +44,18 @@ class Settings(BaseSettings):
             "that asks for more is rejected outright."
         ),
     )
+    max_output_ceiling: int = Field(
+        default=1000,
+        ge=64,
+        le=1_000_000,
+        description=(
+            "The largest single response the provider will grant, used to clamp "
+            "the writer's larger retry. Groq refuses a request for more output "
+            "than a minute's whole budget with '429 Request too large', which no "
+            "wait can fix, so the retry must never ask for it. Raise this on a "
+            "paid tier."
+        ),
+    )
 
     # --- Search ------------------------------------------------------------
     tavily_api_key: str = Field(default="", description="API key for Tavily search.")
@@ -60,7 +72,10 @@ class Settings(BaseSettings):
 
     # --- Orchestration -----------------------------------------------------
     max_questions: int = Field(
-        default=5, ge=1, le=20, description="Questions the planner may generate per round."
+        default=2,
+        ge=1,
+        le=20,
+        description="Questions the planner may generate per round.",
     )
     max_review_cycles: int = Field(
         default=2, ge=0, le=10, description="How many times the critic may force a revision."

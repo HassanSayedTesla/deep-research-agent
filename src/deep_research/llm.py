@@ -64,6 +64,23 @@ def build_llm(settings: Settings) -> LLM:
         # request will ask for the same amount. 512 leaves headroom for the
         # structured-output calls, which also pay for schema tokens.
         max_tokens=settings.max_output_tokens,
+        # Turn OFF the SDK's own retry loop. LlamaIndex wraps every chat call in
+        # `llm_retry_decorator`, which retries *any* 429 up to `max_retries`
+        # times with up to 20s of jittered backoff. It cannot tell a transient
+        # per-minute limit from a dead daily budget, so on a day the quota is
+        # gone it sleeps through the entire retry budget and only then hands the
+        # error up. Observed in a live run:
+        #
+        #   Retrying llama_index.llms.openai.base.OpenAI._achat in 120 seconds ...
+        #     on tokens per day (TPD): Limit 200000, Used 199601
+        #
+        # That defeats `with_rate_limit_retry` entirely, which exists precisely
+        # to fail fast on a long window and let the caller degrade to something
+        # useful. The transport-level `max_retries` is set to match, because the
+        # openai client retries 429s on its own too. With both disabled,
+        # `with_rate_limit_retry` is the single place that decides whether to
+        # wait, and it can act on the distinction the SDK throws away.
+        max_retries=0,
     )
 
 
@@ -152,6 +169,15 @@ async def check_model_available(settings: Settings) -> str:
 # rather than guessing, so a retry lands just after the window reopens.
 _RETRY_AFTER = re.compile(r"try again in ([\d.]+)\s*s", re.IGNORECASE)
 
+# The budget windows long enough that retrying cannot pay off: the day's, the
+# week's or the month's allowance is gone, and it does not come back inside a
+# research run. Groq still offers a "try again in 6m49s" in these messages,
+# which is misleading enough to be worth matching on explicitly.
+_LONG_WINDOW = re.compile(
+    r"tokens per (day|week|month)|\b(TPD|RPD|MPD)\b|requests per (day|week|month)",
+    re.IGNORECASE,
+)
+
 
 def _retry_delay(exc: Exception, attempt: int) -> float:
     """Seconds to wait before retrying `exc`."""
@@ -161,49 +187,84 @@ def _retry_delay(exc: Exception, attempt: int) -> float:
     return min(2.0**attempt, 30.0)
 
 
-def _is_rate_limit(exc: Exception) -> bool:
-    """Is this a 429 that a retry might actually fix?
+def is_quota_error(exc: Exception) -> bool:
+    """Did the provider refuse this call because of a quota?
 
-    Groq overloads the 429 code for two very different situations, and they are
-    not equally recoverable:
-
-      429 "Rate limit reached ... Please try again in 15.9s"
-          Transient. Waiting works.
-
-      413 "Request too large ... ITPM: Limit 7000, Requested 8308"
-          The request alone exceeds the per-minute budget. No amount of waiting
-          helps, because the next request will be just as large. Retrying only
-          burns wall-clock time before failing the same way, so it is reported
-          as permanent and the message points at the real fix.
+    True for every rate-limit refusal, transient or not. Callers use this to
+    decide whether the run can still produce something useful by other means -
+    a dead writer can fall back to the research notes, for instance.
     """
     status = getattr(exc, "status_code", None)
     if status == 413 or "too large" in str(exc).lower():
-        return False
+        return True
     return status == 429 or "RateLimit" in type(exc).__name__ or "rate_limit" in str(exc).lower()
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Would waiting plausibly let this call succeed?
+
+    Groq overloads one 429 code for three quite different situations, and only
+    one of them is worth retrying:
+
+      429 "... on tokens per minute (TPM): Limit 7000, Requested 8308.
+           Please try again in 6.95s"
+          Transient. The window is seconds away, so waiting works.
+
+      429 "... on tokens per day (TPD): Limit 200000, Used 199383"
+          The *day's* budget is gone. The seconds-scale wait in the message is a
+          courtesy, not a real hint: the next request is just as large. Retrying
+          three times in four seconds cannot succeed, it only spends the wall
+          clock and then fails anyway.
+
+      413 "Request too large ... on tokens per request (TPR): Limit 8192"
+          One request exceeds the ceiling. No wait helps, ever, because the next
+          request will be just as large.
+
+    So a quota error is only retried when the window is short enough that the
+    pipeline will still be running when it reopens.
+    """
+    if not is_quota_error(exc):
+        return False
+    if _LONG_WINDOW.search(str(exc)):
+        return False
+    status = getattr(exc, "status_code", None)
+    if status == 413 or "too large" in str(exc).lower():
+        return False
+    return True
 
 
 async def with_rate_limit_retry(
     operation: Any,
     attempts: int = 3,
     base_delay: float = 2.0,
+    should_retry: Any | None = None,
 ) -> Any:
     """Await `operation()`, retrying a 429 with backoff.
 
-    A rate limit is a transient condition, not a reason to lose a run that has
-    already paid for its planner call and its research fan-out. Without this, one
-    unlucky minute kills the whole pipeline and the report is never written.
+    A short-window rate limit is a transient condition, not a reason to lose a
+    run that has already paid for its planner call and its research fan-out.
+    Without this, one unlucky minute kills the whole pipeline and the report is
+    never written. A long-window limit is not retried at all - see
+    `is_retryable` - and fails fast so the caller can degrade instead.
+
+    `should_retry(exc)` can veto a retry that would otherwise be attempted. It
+    exists for the writer, which streams tokens straight to the browser: once
+    some have been sent, a retry appends a second draft to the first, so a
+    later refusal has to be handed back as a partial draft rather than retried.
     """
     last: Exception | None = None
     for attempt in range(attempts):
         try:
             return await operation()
         except Exception as exc:
-            if not _is_rate_limit(exc) or attempt == attempts - 1:
+            if should_retry is not None and not should_retry(exc):
+                raise
+            if not is_retryable(exc) or attempt == attempts - 1:
                 raise
             last = exc
             delay = _retry_delay(exc, attempt)
             logger.warning(
-                "rate limited (attempt %d/%d), waiting %.1fs: %s",
+                "rate limited (attempt %d/%d, waiting %.1fs): %s",
                 attempt + 1,
                 attempts,
                 delay,

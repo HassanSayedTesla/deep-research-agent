@@ -69,6 +69,104 @@ def test_health_flags_missing_keys(tmp_path):
     assert payload["status"] == "needs_config"
 
 
+def test_health_is_ready_for_a_serper_only_deployment(tmp_path):
+    """A Serper deployment has no Tavily key and must not be told it is unconfigured.
+
+    The health check tested `tavily_api_key` directly, so `SEARCH_PROVIDER=serper`
+    with a working `SERPER_API_KEY` reported `needs_config` while
+    `/api/research` worked fine.
+    """
+    from conftest import make_settings
+
+    settings = make_settings(
+        tmp_path,
+        search_provider="serper",
+        tavily_api_key="",
+        serper_api_key="serper-key",
+    )
+    payload = TestClient(create_app(settings)).get("/api/health").json()
+
+    assert payload["search_provider"] == "serper"
+    assert payload["status"] == "ok"
+
+
+async def test_an_idle_stream_emits_a_keepalive_comment(tmp_path, monkeypatch):
+    """A gap between the last finding and the first token can exceed a minute.
+
+    `SSE_KEEPALIVE_SECONDS` existed with a comment describing exactly this, and
+    nothing ever emitted a frame, so a proxy in the path was entitled to close
+    the connection and the client only found out when no report ever arrived.
+
+    Driven through `ASGITransport` rather than `TestClient`, which buffers the
+    whole response and so can never observe a mid-stream frame.
+    """
+    import asyncio
+
+    import deep_research.server as server_mod
+    from conftest import make_settings
+    from deep_research.events import RunEvent
+
+    # The generator reads the module constant, so shortening it here is enough.
+    monkeypatch.setattr(server_mod, "SSE_KEEPALIVE_SECONDS", 0.05)
+
+    class _IdleRunner:
+        """Emits one event, then stays silent past several keepalive intervals."""
+
+        run_id = "r"
+
+        def __init__(self, *_: object, **__: object) -> None:
+            pass
+
+        async def run(self):
+            yield RunEvent(kind="log", data={"message": "working"})
+            await asyncio.sleep(0.3)
+            yield RunEvent(kind="done", data={})
+
+    app = create_app(make_settings(tmp_path), runner_factory=lambda topic, s, store: _IdleRunner())
+
+    import httpx
+
+    frames: list[str] = []
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        async with client.stream("POST", "/api/research", json={"topic": "gearboxes"}) as resp:
+            async for line in resp.aiter_lines():
+                if line:
+                    frames.append(line)
+
+    assert any(line.startswith(":") for line in frames), (
+        f"expected an SSE comment keepalive, got {frames[:8]!r}"
+    )
+    # And the real events still arrive: the keepalive is additive, not a
+    # replacement for the stream.
+    assert any("working" in line for line in frames)
+    assert any('"done"' in line for line in frames)
+
+
+def test_unknown_run_with_unreadable_metadata_is_a_404(tmp_path):
+    """A `meta.json` that is valid JSON but the wrong shape must not 500.
+
+    `list_runs` reads the raw dict, so such a run is listed; the follow-up
+    detail request then raised an uncaught `TypeError` from the dataclass
+    constructor and returned a 500 for a run the list had just advertised.
+    """
+    from conftest import make_settings
+
+    settings = make_settings(tmp_path)
+    run_id = "20260101-000000-000000-broken"
+    broken = settings.runs_dir / run_id
+    broken.mkdir(parents=True)
+    (broken / "meta.json").write_text(json.dumps({"unexpected": "shape"}), encoding="utf-8")
+
+    client = TestClient(create_app(settings))
+
+    listed = client.get("/api/runs").json()["runs"]
+    assert any(row.get("unexpected") == "shape" for row in listed), "it should be listed"
+
+    detail = client.get(f"/api/runs/{run_id}")
+    assert detail.status_code == 404
+
+
 def test_graph_endpoint_returns_the_topology(client: TestClient):
     payload = client.get("/api/graph").json()
 

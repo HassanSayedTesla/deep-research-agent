@@ -36,10 +36,34 @@ from ..config import Settings
 # waiting could fix. 300 keeps a useful excerpt and roughly halves the cost.
 SNIPPET_CHARS = 300
 
-# How many searches one researcher may make. The agent decides when to stop, and
-# an unbounded loop is the most reliable way to outgrow the context window. Past
-# this the tool says so and the model is asked to answer with what it has.
+# How many searches ONE researcher may spend on its own question.
+#
+# This used to be a single pool shared by every researcher, and that was wrong in
+# a way only a live run revealed: the pool was sized from the shared
+# `RESEARCHER_MAX_ITERATIONS`, so a researcher that looped to its own cap could
+# spend the whole run's allowance and leave a sibling with nothing. That
+# researcher then received the "budget spent" reply having retrieved no sources,
+# wrote its finding from memory, and the writer cited it as research. The pool
+# is now per researcher (`WebSearcher.for_agent`), so this number is a hard
+# ceiling on one question's searching and no researcher can starve another.
+#
+# Three searches, plus the write-up, fits inside the default iteration cap of 6.
 MAX_SEARCH_CALLS_PER_RUN = 3
+
+
+def searches_per_question(settings: Settings) -> int:
+    """Provider calls the whole run may make, across every planned research round.
+
+    A critic revision re-runs research, and each revised researcher gets a fresh
+    per-question allowance from `for_agent`. The run-wide ceiling must therefore
+    cover the first pass plus every revision the settings allow. A live run with
+    one review cycle billed its whole allowance in the first pass; the second
+    pass was refused every search and could not repair the draft the critic had
+    just rejected.
+    """
+    rounds = max(0, settings.max_review_cycles) + 1
+    return MAX_SEARCH_CALLS_PER_RUN * max(1, settings.max_questions) * rounds
+
 
 SERPER_BASE_URL = "https://google.serper.dev"
 SERPER_TIMEOUT = 20.0
@@ -137,16 +161,37 @@ class SerperClient:
 
 
 @dataclass(slots=True)
+class _RunQuota:
+    """State one run shares across every researcher's searcher.
+
+    `calls` counts searches that actually reached a provider, which is what gets
+    billed. It is deliberately *not* per-researcher: the run-wide ceiling in
+    `search_budget` exists to bound spend no matter how many questions the
+    planner produces, and that only means something if it is counted in one
+    place.
+    """
+
+    calls: int = 0
+
+
+@dataclass(slots=True)
 class WebSearcher:
-    """Builds the `web_search` tool, backed by a provider and an on-disk cache."""
+    """Builds the `web_search` tool, backed by a provider and an on-disk cache.
+
+    A root instance owns the run's provider client, cache and billed-call count.
+    `for_agent` hands out per-researcher views over that same state: each gets
+    its own search allowance, while the cache, the HTTP client and the run-wide
+    ceiling stay shared.
+    """
 
     settings: Settings
     client: Any | None = None
     cache: SearchCache | None = None
-    # `queries` counts tool invocations (cache included); `calls` counts only the
-    # upstream searches that were actually billed.
+    # `queries` counts this researcher's own tool invocations that reached the
+    # provider (cache hits are free and do not count). `calls`, the run-wide
+    # billed total, lives on the shared `_quota`.
     queries: int = field(default=0, init=False)
-    calls: int = field(default=0, init=False)
+    _quota: _RunQuota | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.cache is None:
@@ -156,6 +201,27 @@ class WebSearcher:
             )
         if self.client is None:
             self.client = self._build_client()
+        if self._quota is None:
+            self._quota = _RunQuota()
+
+    def for_agent(self) -> WebSearcher:
+        """A view for one researcher: its own allowance, the run's resources.
+
+        Cheap - no new client, no new cache - so this can be called per question
+        to give each researcher a search budget of its own.
+        """
+        return WebSearcher(
+            self.settings,
+            client=self.client,
+            cache=self.cache,
+            _quota=self._quota,
+        )
+
+    @property
+    def calls(self) -> int:
+        """Searches this run has actually been billed for, across all researchers."""
+        assert self._quota is not None
+        return self._quota.calls
 
     def _build_client(self) -> Any | None:
         provider = self.settings.search_provider
@@ -170,9 +236,69 @@ class WebSearcher:
             )
         return None
 
+    def agent_budget(self) -> int:
+        """How many searches *this* researcher may make on its own question."""
+        return MAX_SEARCH_CALLS_PER_RUN
+
+    def search_budget(self) -> int:
+        """How many provider calls this run may make in total, across all questions.
+
+        A backstop on total spend, sized as the per-researcher allowance times the
+        number of questions times the planned research rounds. It does not need to
+        be generous: no researcher can exceed `agent_budget` in one round, so this
+        only binds if the planner produces more questions than the budget
+        anticipated.
+        """
+        return searches_per_question(self.settings)
+
     async def search(self, query: str) -> str:
         """Return a condensed web search result for `query`."""
         assert self.cache is not None
+
+        # These two answers are control flow, not search results, so they are
+        # returned *before* the cache is consulted. They used to be produced
+        # inside `cache.wrap`, which persists whatever its producer returns -
+        # so "Search budget spent (8 queries so far)" was written to the shared
+        # on-disk cache and then served for `CACHE_TTL_HOURS` to a *different*
+        # run, with zero billed calls, telling a fresh researcher to stop
+        # searching and answer from sources it had never been given.
+        if self.client is None:
+            return "Web search is disabled for this run. Answer from your own knowledge."
+
+        # Two ceilings, and they guard different things.
+        #
+        # The per-researcher one bounds how much *this* agent's own context can
+        # grow: every result is re-sent on each later turn, so an agent that
+        # keeps searching pays for it twice over. It is per researcher, so no
+        # researcher can spend a sibling's allowance.
+        #
+        # The run-wide one bounds total spend however many questions the planner
+        # produced. It is a backstop, not the primary limit, and a researcher
+        # that trips it is told the truth rather than a guess about its own
+        # history.
+        #
+        # A cache hit is free, so it must consume neither: `queries` is
+        # incremented in `_search_uncached`, next to the billed `calls`.
+        if self.queries >= self.agent_budget() or self.calls >= self.search_budget():
+            # The wording matters twice over: it has to end the loop, and it has
+            # to be true. A live run spent the whole pool and this reply still
+            # said "using the sources already gathered", so a researcher that had
+            # in fact retrieved nothing answered at length from memory and the
+            # writer received that as a finding.
+            #
+            # So it asserts nothing about what the caller has. The tool cannot
+            # see the calling agent's history, so any claim about "the sources
+            # you gathered" would be a guess - and a wrong one invents citations.
+            return (
+                f"Search budget spent ({self.queries} of your {self.agent_budget()} "
+                f"searches used). Do not call this tool again. Write your final "
+                "answer now. If this conversation already contains search results, "
+                "answer from them and keep their links inline. If it contains none, "
+                "say plainly at the top of your answer that nothing could be "
+                "verified here, then answer from your own knowledge and flag every "
+                "claim you could not confirm."
+            )
+
         # The provider is part of the key: a Tavily answer and a Serper answer
         # for the same query are different results, and must not share a cache
         # entry just because the query text matches.
@@ -182,25 +308,14 @@ class WebSearcher:
             str(self.settings.search_max_results),
             _CACHE_FORMAT,
         )
-        self.queries += 1
         return await self.cache.wrap(key, lambda: self._search_uncached(query))
 
     async def _search_uncached(self, query: str) -> str:
-        if self.client is None:
-            return "Web search is disabled for this run. Answer from your own knowledge."
-
-        # One searcher is shared by every researcher in a run, so this counts the
-        # whole run, not one agent. The cap exists because each result lands in
-        # the calling agent's message history and is re-sent on every later turn;
-        # an agent that keeps searching grows its own context without limit.
-        if self.queries > MAX_SEARCH_CALLS_PER_RUN * max(1, self.settings.max_questions):
-            return (
-                f"Search budget spent ({self.queries} queries so far). "
-                "Do not call this tool again. Write your final answer now using "
-                "the sources already gathered, and say if something is unverified."
-            )
-
-        self.calls += 1
+        # Counted here, after the cache miss, so a served-from-cache query costs
+        # nothing and does not eat into any search budget.
+        assert self._quota is not None
+        self.queries += 1
+        self._quota.calls += 1
         payload = await self.client.search(query, max_results=self.settings.search_max_results)
         if self.settings.search_provider == "serper":
             return self.format_serper_results(payload)

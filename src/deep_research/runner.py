@@ -99,7 +99,13 @@ class ResearchRunner:
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        await task
+        # Only await a task that actually finished. Awaiting a *cancelled* task
+        # re-raises `CancelledError` - a `BaseException`, so it escapes `run()`
+        # entirely. A consumer that stops reading once it sees `done` cancels the
+        # cleanup tail of the task, and that must not turn a complete, persisted
+        # result into a traceback.
+        if not task.cancelled():
+            await task
 
     # -- internals ----------------------------------------------------------
     async def _execute(self) -> None:
@@ -120,7 +126,22 @@ class ResearchRunner:
 
             llm = self._llm or build_llm(self.settings)
             searcher = self._searcher or WebSearcher(self.settings)
-            research_agent = self._research_agent or build_research_agent(llm, searcher)
+
+            # One agent per question, each with its own search allowance over the
+            # shared searcher. A single shared agent meant a single shared search
+            # budget, and a researcher that looped to its cap could spend the whole
+            # run's allowance, leaving a sibling to report having no sources.
+            injected = self._research_agent
+            research_agent_factory = None
+            research_agent = injected
+            if injected is None:
+
+                def research_agent_factory(_index: int) -> Any:
+                    return build_research_agent(llm, searcher.for_agent())
+
+                # Only used for run metadata (`tools_used`); the workflow asks the
+                # factory once per question.
+                research_agent = research_agent_factory(0)
             workflow = build_workflow(self.settings)
 
             await self.bridge.emit(
@@ -134,6 +155,7 @@ class ResearchRunner:
             deps = ResearchDeps(
                 llm=llm,
                 research_agent=research_agent,
+                research_agent_factory=research_agent_factory,
                 searcher=searcher,
                 settings=self.settings,
                 bridge=self.bridge,

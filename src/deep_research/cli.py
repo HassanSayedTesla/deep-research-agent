@@ -214,11 +214,17 @@ def research(
         console.print(f"[red]Invalid configuration:[/] {exc}")
         raise typer.Exit(code=2) from exc
 
+    # `typer.Exit` subclasses `RuntimeError`, so raising it inside this `try`
+    # lets a *successful* run be caught by its own handler and re-raised as
+    # exit code 1 - every successful research reported failure to the shell,
+    # breaking any `&&` chain or CI step that checked `$?`. Compute the code
+    # inside the `try` and raise outside it.
     try:
-        raise typer.Exit(code=asyncio.run(_run(topic, settings)))
+        code = asyncio.run(_run(topic, settings))
     except (ValueError, RuntimeError) as exc:
         console.print(f"[red]{exc}[/]")
         raise typer.Exit(code=1) from exc
+    raise typer.Exit(code=code)
 
 
 @app.command()

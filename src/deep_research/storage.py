@@ -34,9 +34,17 @@ def slugify(text: str, max_length: int = 40) -> str:
 
 
 def new_run_id(topic: str, now: datetime | None = None) -> str:
-    """Timestamp-prefixed, topic-derived id: `20260929-141233-gearbox-types`."""
-    stamp = (now or datetime.now(UTC)).astimezone().strftime("%Y%m%d-%H%M%S")
-    return f"{stamp}-{slugify(topic)}"
+    """Timestamp-prefixed, topic-derived id: `20260929-141233-gearbox-types`.
+
+    The microseconds are not decoration. The id is to the second, so two runs
+    started in the same second - two browser tabs, or a double-click on
+    "research" - resolved to the same id and wrote over each other's
+    `report.md`, `meta.json` and `events.jsonl` in one directory. Only one of
+    the two then appeared in the run list.
+    """
+    moment = (now or datetime.now(UTC)).astimezone()
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    return f"{stamp}-{moment.microsecond:06d}-{slugify(topic)}"
 
 
 @dataclass(slots=True)
@@ -115,8 +123,16 @@ class RunStore:
         path = self.run_dir(run_id) / "meta.json"
         if not path.exists():
             raise FileNotFoundError(f"No metadata for run {run_id!r}")
-        stored = json.loads(path.read_text(encoding="utf-8"))
-        return RunMeta(**{k: v for k, v in stored.items() if k in _META_FIELDS})
+        try:
+            stored = json.loads(path.read_text(encoding="utf-8"))
+            return RunMeta(**{k: v for k, v in stored.items() if k in _META_FIELDS})
+        except (json.JSONDecodeError, TypeError) as exc:
+            # `list_runs` reads the raw dict, so a half-written or
+            # schema-mismatched `meta.json` still gets listed - and then the
+            # follow-up detail request raised an uncaught `TypeError` and
+            # returned a 500 for a run the list had just advertised. Raising the
+            # one error callers already handle keeps that a clean 404.
+            raise FileNotFoundError(f"Metadata for run {run_id!r} is unreadable: {exc}") from exc
 
     def load_events(self, run_id: str) -> list[dict[str, Any]]:
         path = self.run_dir(run_id) / "events.jsonl"

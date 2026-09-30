@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from openai import RateLimitError
 from pydantic import ValidationError
 from rich.console import Console
 
@@ -47,6 +48,8 @@ from deep_research.llm import (
     available_models,
     build_llm,
     check_model_available,
+    is_quota_error,
+    is_retryable,
     with_rate_limit_retry,
 )
 from deep_research.prompts import PLANNER_PROMPT
@@ -470,6 +473,31 @@ async def test_deps_without_a_gate_still_work(settings: Settings):
         pass
 
 
+def test_search_budget_covers_planned_review_rounds(settings: Settings):
+    """A critic revision must not inherit an already-spent search allowance.
+
+    Each revised researcher gets a fresh per-question allowance from `for_agent`,
+    so the run-wide ceiling has to cover the first research pass plus every
+    revision the settings allow. A live run with one review cycle billed its
+    whole allowance in the first pass; the revision pass was refused every
+    search and could not repair the draft the critic had just rejected.
+    """
+    from deep_research.tools.web_search import MAX_SEARCH_CALLS_PER_RUN, WebSearcher
+
+    fresh = WebSearcher(
+        make_settings(settings.runs_dir, max_review_cycles=0),
+        client=StubTavilyClient(),
+    )
+    revised = WebSearcher(
+        make_settings(settings.runs_dir, max_review_cycles=1),
+        client=StubTavilyClient(),
+    )
+    one_round = MAX_SEARCH_CALLS_PER_RUN * settings.max_questions
+
+    assert fresh.search_budget() == one_round
+    assert revised.search_budget() == 2 * one_round
+
+
 async def test_the_spent_search_budget_tells_the_model_to_stop(settings: Settings):
     """The exhausted-budget reply must end the loop, not invite another call.
 
@@ -478,19 +506,86 @@ async def test_the_spent_search_budget_tells_the_model_to_stop(settings: Setting
     and spin until LlamaIndex aborted the whole run. Wording matters here, so
     the instruction is asserted rather than trusted.
     """
-    from deep_research.tools.web_search import MAX_SEARCH_CALLS_PER_RUN, WebSearcher
+    from deep_research.tools.web_search import WebSearcher
 
     searcher = WebSearcher(settings, client=StubTavilyClient())
-    allowed = MAX_SEARCH_CALLS_PER_RUN * max(1, settings.max_questions)
-    for _ in range(allowed + 2):
-        await searcher.search("gearbox shock load")
+    allowed = searcher.search_budget()
+    # Distinct queries, because a repeat of the same query is a cache hit and
+    # costs the provider nothing - it no longer counts against the budget.
+    for i in range(allowed + 2):
+        await searcher.search(f"gearbox shock load {i}")
 
-    reply = await searcher._search_uncached("one more")
+    # Through the public entry point: the budget check deliberately lives in
+    # `search()` rather than in the cached producer, so calling the producer
+    # directly would bypass it entirely.
+    reply = await searcher.search("one more")
 
     assert "budget spent" in reply
     assert "Do not call this tool again" in reply
     # The provider was billed at most the allowance; the rest were refusals.
     assert searcher.calls <= allowed
+
+
+def _groq_429(message: str) -> RateLimitError:
+    return RateLimitError(
+        message,
+        response=httpx.Response(429, request=httpx.Request("POST", "https://api.groq.com")),
+        body=None,
+    )
+
+
+def test_a_daily_budget_is_not_retried():
+    """The day's tokens are gone, so three retries in four seconds are wasted.
+
+    A live run burned its whole 900-second budget on this: the retry helper saw
+    a 429, waited 1s then 2s, failed, and the run limped on into a second
+    research round that could not succeed either.
+    """
+
+    exc = _groq_429(
+        "Rate limit reached for model `qwen/qwen3.8-27b` service tier `on_demand` "
+        "on tokens per day (TPD): Limit 200000, Used 199383, Requested 1566. "
+        "Please try again in 6m49.968s."
+    )
+    assert is_quota_error(exc), "it is still a quota error, so callers may degrade"
+    assert not is_retryable(exc), "but waiting four seconds cannot help"
+
+
+def test_a_minute_budget_is_still_retried():
+
+    exc = _groq_429(
+        "Rate limit reached for model `qwen/qwen3.8-27b` service tier `on_demand` "
+        "on tokens per minute (TPM): Limit 7000, Requested 8308. "
+        "Please try again in 6.95s."
+    )
+    assert is_retryable(exc), "a per-minute window reopens in seconds"
+
+
+def test_an_oversized_request_is_neither_retried_nor_treated_as_transient():
+
+    exc = _groq_429(
+        "Request too large for model `qwen/qwen3.8-27b` on tokens per request "
+        "(TPR): Limit 8192, Requested 8308"
+    )
+    assert is_quota_error(exc)
+    assert not is_retryable(exc), "the next request will be just as large"
+
+
+async def test_a_daily_budget_fails_fast_instead_of_retrying():
+    """The retry helper must not sit in a sleep loop on a dead day's quota."""
+    attempts = {"n": 0}
+
+    async def always_denied():
+        attempts["n"] += 1
+        raise _groq_429(
+            "Rate limit reached ... on tokens per day (TPD): Limit 200000, "
+            "Used 199383, Requested 1566. Please try again in 6m49.968s."
+        )
+
+    with pytest.raises(RateLimitError):
+        await with_rate_limit_retry(always_denied, base_delay=0.0)
+
+    assert attempts["n"] == 1, "a dead daily budget should not be retried"
 
 
 def test_truncating_a_note_keeps_its_links():
@@ -632,6 +727,40 @@ def test_build_llm_uses_the_configured_model(monkeypatch):
 
     assert llm.model == "llama-3.1-8b-instant"
     assert llm.temperature == settings.temperature
+
+
+def test_build_llm_disables_the_sdk_retry_loop():
+    """The SDK must not retry underneath our own rate-limit policy.
+
+    LlamaIndex wraps every chat call in `llm_retry_decorator`, which retries
+    *any* 429 up to `max_retries` times with up to 20s of backoff. It cannot
+    tell a transient per-minute limit from a dead daily budget, so on an
+    exhausted day it slept through the whole retry budget - "Retrying
+    llama_index.llms.openai.base.OpenAI._achat in 120 seconds ... on tokens per
+    day (TPD): Limit 200000" - before handing the error up. That defeats
+    `with_rate_limit_retry`, which exists to fail fast on a long window so the
+    caller can degrade to something useful. `max_retries <= 0` makes the
+    decorator call through untouched, leaving one place that decides to wait.
+    """
+    settings = Settings(groq_api_key="k", _env_file=None)
+
+    assert build_llm(settings).max_retries == 0
+
+    # And the decorator really does become a pass-through at zero.
+    import llama_index.llms.openai.base as sdk
+
+    calls: list[int] = []
+
+    class _Llm:
+        max_retries = 0
+
+        @sdk.llm_retry_decorator
+        def _achat(self) -> str:
+            calls.append(1)
+            return "ok"
+
+    assert _Llm()._achat() == "ok"
+    assert calls == [1], "a single attempt, with no retry wrapper in between"
 
 
 def test_build_llm_refuses_without_a_key():
@@ -841,8 +970,40 @@ async def test_the_cache_does_reuse_a_repeated_query_within_a_provider(tmp_path:
     await searcher.search("same query")
 
     assert len(client.calls) == 1, "the second identical query should hit the cache"
-    assert searcher.queries == 2
+    # A served-from-cache query reaches no provider, so it must not consume the
+    # per-run search budget either. Counting it meant a run could exhaust its
+    # allowance without ever doing the research it was budgeted for.
+    assert searcher.queries == 1
     assert searcher.calls == 1
+
+
+async def test_the_spent_budget_message_is_never_cached(tmp_path: Path):
+    """The "budget spent" reply is control flow, not a search result.
+
+    It used to be produced inside `cache.wrap`, which persists whatever its
+    producer returns. It was then served from disk - carrying the *previous*
+    run's query count - to a different run that had never searched anything,
+    for the full cache TTL and with zero billed calls, telling that run's
+    researcher to stop and answer from sources it had never been given.
+    """
+    from deep_research.tools.web_search import WebSearcher
+
+    shared = tmp_path / "cache.json"
+    budget_spent = WebSearcher(make_settings(tmp_path), client=StubTavilyClient())
+    allowed = budget_spent.search_budget()
+    for i in range(allowed + 2):
+        await budget_spent.search(f"gearbox shock load {i}")
+    assert "budget spent" in await budget_spent.search("one more")
+
+    # A brand new searcher, sharing the same on-disk cache, must still be able
+    # to search normally.
+    fresh = WebSearcher(
+        make_settings(tmp_path), client=StubTavilyClient(), cache=SearchCache(shared)
+    )
+    result = await fresh.search("a question no run has asked before")
+
+    assert "budget spent" not in result
+    assert fresh.calls == 1, "the fresh run should have been billed a real search"
 
 
 # -- the Serper HTTP client ------------------------------------------------
@@ -1019,6 +1180,114 @@ def test_worker_node_ids_round_trip():
     assert worker_node_id(0) == "research#0"
     assert parse_node_id("research#3") == ("research", 3)
     assert parse_node_id("writer") == ("writer", None)
+
+
+def test_a_finished_report_is_not_mistaken_for_a_truncated_one():
+    """Ending on a bullet, bold marker or non-Latin glyph is *normal*.
+
+    `_looks_truncated` used to end in an unconditional `return True`, so its
+    verdict depended only on the three checks above it. Every report ending in
+    a bullet, a closing `**`, a URL or a full-width character was then declared
+    cut off, which sent the writer into a second provider call on a quota that
+    might already be spent - and, before the `retry_stream` fix, crashed the
+    run outright on a name error.
+    """
+    from deep_research.workflow import _looks_truncated
+
+    finished = [
+        "The reducer tolerates shock by *not* absorbing it.",
+        "Findings:\n- planetary carriers share the load\n- helical backup takes the peak",
+        "Overall the design is **adequate**",
+        "See https://example.com/gearbox-spec for the full table",
+        "总结：行星齿轮减速器可以吸收冲击载荷",  # noqa: RUF001 - the fullwidth colon is the point
+        "1. First\n2. Second",
+        "```\nplain block\n```",
+    ]
+    for text in finished:
+        assert _looks_truncated(text) is False, f"wrongly called truncated: {text!r}"
+
+
+def test_a_draft_cut_off_by_the_token_cap_is_detected():
+    """Unclosed markdown is the shape-based signal; the bare word is not.
+
+    A report stopping at "...18CrNiMo" is indistinguishable from one ending in a
+    bullet as a matter of text shape, which is why the provider's
+    `finish_reason="length"` - not this function - is the primary signal (see
+    `test_the_provider_length_cap_is_the_authoritative_signal`). What is left
+    here are the constructs that cannot be finished.
+    """
+    from deep_research.workflow import _looks_truncated
+
+    cut = [
+        "",
+        "The casing is cast in **ductile iron and the pinion is",
+        "```python\ndef load(self):\n    return self._",
+        "## Recommendations\n- upgrade the bearings\n## Risks",
+    ]
+    for text in cut:
+        assert _looks_truncated(text) is True, f"missed a cut: {text!r}"
+
+
+def test_the_provider_length_cap_is_the_authoritative_signal():
+    """`finish_reason == "length"` beats guessing from the text."""
+    from deep_research.workflow import _hit_length_cap
+
+    class _Choice:
+        def __init__(self, reason: str) -> None:
+            self.finish_reason = reason
+
+    class _Raw:
+        def __init__(self, *choices: object) -> None:
+            self.choices = choices
+
+    class _Chunk:
+        def __init__(self, raw: object) -> None:
+            self.raw = raw
+
+    assert _hit_length_cap(_Chunk(_Raw(_Choice("length")))) is True
+    assert _hit_length_cap(_Chunk(_Raw(_Choice("stop")))) is False
+    # A chunk with no provider detail at all must not raise or claim a cut.
+    assert _hit_length_cap(_Chunk(None)) is False
+    assert _hit_length_cap(_Chunk(_Raw())) is False
+
+
+def test_a_successful_research_exits_zero(monkeypatch, tmp_path: Path):
+    """A finished report must not be reported to the shell as a failure.
+
+    `typer.Exit` subclasses `RuntimeError`, and the success path used to
+    `raise typer.Exit(code=...)` *inside* the `except (ValueError, RuntimeError)`
+    try block. The CLI therefore caught its own success, printed an empty red
+    line, and exited 1 - after writing a perfectly good report. Every `&&`
+    chain, CI step or wrapper checking `$?` saw a crash.
+    """
+    from typer.testing import CliRunner
+
+    async def fake_run(topic: str, settings: Settings) -> int:
+        return 0
+
+    monkeypatch.setattr(cli, "_run", fake_run)
+    monkeypatch.setattr(cli, "_settings", lambda **_kwargs: make_settings(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["research", "gearbox selection"])
+
+    assert result.exit_code == 0, f"expected success, got {result.exit_code}\n{result.output}"
+
+
+def test_a_failed_research_exits_one(monkeypatch, tmp_path: Path):
+    """The counterpart: a genuine failure must still be non-zero."""
+
+    from typer.testing import CliRunner
+
+    async def fake_run(topic: str, settings: Settings) -> int:
+        raise RuntimeError("the provider is unreachable")
+
+    monkeypatch.setattr(cli, "_run", fake_run)
+    monkeypatch.setattr(cli, "_settings", lambda **_kwargs: make_settings(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["research", "gearbox selection"])
+
+    assert result.exit_code == 1
+    assert "the provider is unreachable" in result.output
 
 
 def test_glyphs_fall_back_when_the_console_cannot_encode_them(monkeypatch):
