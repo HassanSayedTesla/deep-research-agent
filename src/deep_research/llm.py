@@ -74,7 +74,7 @@ async def check_model_available(settings: Settings) -> str:
     model = settings.model or DEFAULT_MODEL
     try:
         models = await available_models(settings.groq_api_key)
-    except Exception as exc:  # noqa: BLE001 - a preflight must never block a good run
+    except Exception as exc:
         logger.warning("could not list Groq models (%s); skipping preflight", exc)
         return model
 

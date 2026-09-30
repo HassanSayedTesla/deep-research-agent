@@ -21,8 +21,9 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
-from deep_research.schemas import ResearchPlan, ReviewVerdict
 from llama_index.core.prompts.base import BasePromptTemplate
+
+from deep_research.schemas import ResearchPlan, ReviewVerdict
 
 
 @dataclass
@@ -58,7 +59,7 @@ class FakeLLM:
         # `str` is why that bug reached production: the suite passed while every
         # live call fell back to lenient parsing.
         if not isinstance(prompt, BasePromptTemplate):
-            raise TypeError(  # noqa: TRY003 - the message is the assertion
+            raise TypeError(
                 "astructured_predict needs a PromptTemplate, not "
                 f"{type(prompt).__name__}; wrap it with RichPromptTemplate"
             )

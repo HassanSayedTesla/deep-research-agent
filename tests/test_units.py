@@ -216,7 +216,9 @@ async def test_the_runner_refuses_to_start_on_a_retired_model(monkeypatch, setti
     from deep_research.runner import ResearchRunner
 
     async def refuse(*_: Any, **__: Any) -> str:
-        raise ModelUnavailableError("MODEL=llama-3.3-70b-versatile is not available to your Groq key.")
+        raise ModelUnavailableError(
+            "MODEL=llama-3.3-70b-versatile is not available to your Groq key."
+        )
 
     monkeypatch.setattr("deep_research.runner.check_model_available", refuse)
 
@@ -255,9 +257,7 @@ async def test_a_runner_given_an_injected_llm_never_calls_the_network(
     assert "run_failed" not in [event.kind for event in events]
 
 
-async def test_an_injected_searcher_is_left_open_for_its_owner(
-    monkeypatch, settings: Settings
-):
+async def test_an_injected_searcher_is_left_open_for_its_owner(monkeypatch, settings: Settings):
     """Closing a caller's searcher is a bug the tests never noticed.
 
     The condition used to be `searcher is self._searcher`, which closed an
