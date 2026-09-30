@@ -28,7 +28,18 @@ from ..config import Settings
 
 # Longest source snippet handed to the model. Both providers return excerpts,
 # not full pages, so this only trims pathologically long ones.
-SNIPPET_CHARS = 600
+#
+# This is a budget knob, not a formatting preference. A researcher's context
+# grows with every tool call and the whole history is re-sent on the next turn,
+# so four 600-char snippets plus the model's own prose reached ~8.3k tokens and
+# tripped Groq's per-minute *input* limit on a request that no amount of
+# waiting could fix. 300 keeps a useful excerpt and roughly halves the cost.
+SNIPPET_CHARS = 300
+
+# How many searches one researcher may make. The agent decides when to stop, and
+# an unbounded loop is the most reliable way to outgrow the context window. Past
+# this the tool says so and the model is asked to answer with what it has.
+MAX_SEARCH_CALLS_PER_RUN = 3
 
 SERPER_BASE_URL = "https://google.serper.dev"
 SERPER_TIMEOUT = 20.0
@@ -177,6 +188,16 @@ class WebSearcher:
     async def _search_uncached(self, query: str) -> str:
         if self.client is None:
             return "Web search is disabled for this run. Answer from your own knowledge."
+
+        # One searcher is shared by every researcher in a run, so this counts the
+        # whole run, not one agent. The cap exists because each result lands in
+        # the calling agent's message history and is re-sent on every later turn;
+        # an agent that keeps searching grows its own context without limit.
+        if self.queries > MAX_SEARCH_CALLS_PER_RUN * max(1, self.settings.max_questions):
+            return (
+                f"Search budget spent ({self.queries} queries so far). "
+                "Answer now using the sources already gathered, and say if something is unverified."
+            )
 
         self.calls += 1
         payload = await self.client.search(query, max_results=self.settings.search_max_results)

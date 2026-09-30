@@ -151,7 +151,23 @@ def _retry_delay(exc: Exception, attempt: int) -> float:
 
 
 def _is_rate_limit(exc: Exception) -> bool:
+    """Is this a 429 that a retry might actually fix?
+
+    Groq overloads the 429 code for two very different situations, and they are
+    not equally recoverable:
+
+      429 "Rate limit reached ... Please try again in 15.9s"
+          Transient. Waiting works.
+
+      413 "Request too large ... ITPM: Limit 7000, Requested 8308"
+          The request alone exceeds the per-minute budget. No amount of waiting
+          helps, because the next request will be just as large. Retrying only
+          burns wall-clock time before failing the same way, so it is reported
+          as permanent and the message points at the real fix.
+    """
     status = getattr(exc, "status_code", None)
+    if status == 413 or "too large" in str(exc).lower():
+        return False
     return status == 429 or "RateLimit" in type(exc).__name__ or "rate_limit" in str(exc).lower()
 
 
