@@ -28,7 +28,7 @@ from .events import (
     RunEvent,
 )
 from .graph import graph_payload
-from .llm import build_llm
+from .llm import build_llm, check_model_available
 from .storage import RunMeta, RunStore, new_run_id
 from .tools.web_search import WebSearcher
 from .workflow import RESEARCH_WORKERS, ResearchDeps, build_workflow
@@ -105,9 +105,18 @@ class ResearchRunner:
     async def _execute(self) -> None:
         started = datetime.now(UTC)
         searcher: WebSearcher | None = self._searcher
+        # Only a searcher this runner built may be closed below; an injected one
+        # may be shared with the caller, and closing it is their decision.
+        owns_searcher = self._searcher is None
         try:
             self.settings.require_llm_key()
             self.settings.require_search_key()
+
+            # Skipped when a fake LLM is injected, so the offline suite never
+            # touches the network. A retired model otherwise surfaces as a 404
+            # on the first call, after the run has already started.
+            if self._llm is None:
+                await check_model_available(self.settings)
 
             llm = self._llm or build_llm(self.settings)
             searcher = self._searcher or WebSearcher(self.settings)
@@ -153,10 +162,9 @@ class ResearchRunner:
             # usually the only clue about what went wrong.
             await self._archive_failure(message, started, self._context)
         finally:
-            # Release the search provider's connection pool, if it owns one.
-            # Only for a searcher this runner built: an injected one may be
-            # shared, and closing it would be someone else's decision.
-            if searcher is not None and searcher is self._searcher:
+            # Release the search provider's connection pool, but only if this
+            # runner is the one that created it.
+            if owns_searcher and searcher is not None:
                 await searcher.aclose()
             await self.bridge.close()
 

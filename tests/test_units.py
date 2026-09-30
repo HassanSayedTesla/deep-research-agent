@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 from pydantic import ValidationError
 from rich.console import Console
@@ -34,7 +37,15 @@ from deep_research.graph import (
     parse_node_id,
     worker_node_id,
 )
-from deep_research.llm import _salvage, build_llm
+from deep_research.llm import (
+    ModelUnavailableError,
+    _salvage,
+    ask_structured,
+    available_models,
+    build_llm,
+    check_model_available,
+)
+from deep_research.prompts import PLANNER_PROMPT
 from deep_research.schemas import ResearchPlan, ReviewVerdict
 from deep_research.tools.web_search import (
     SearchError,
@@ -42,7 +53,7 @@ from deep_research.tools.web_search import (
     WebSearcher,
     build_search_tools,
 )
-from fakes import StubSerperClient, StubTavilyClient
+from fakes import FakeLLM, StubSerperClient, StubTavilyClient
 
 
 # -- settings --------------------------------------------------------------
@@ -96,6 +107,122 @@ def test_env_example_matches_the_real_defaults():
             assert expected == str(default).lower(), (
                 f"{name}: .env.example says {expected!r}, the default is {default!r}"
             )
+
+
+def test_the_default_model_is_the_same_everywhere():
+    """A model name lives in five places. Groq retired ours mid-project.
+
+    Nothing in an offline suite can tell you a model still exists, but it can
+    at least stop the five copies disagreeing, which is how the retired name
+    survived a rename elsewhere.
+    """
+    root = Path(__file__).resolve().parent.parent
+    from deep_research.llm import DEFAULT_MODEL
+
+    assert Settings.model_fields["model"].default == DEFAULT_MODEL, (
+        "config.Settings and llm.DEFAULT_MODEL disagree"
+    )
+
+    example = (root / ".env.example").read_text(encoding="utf-8")
+    assert f"MODEL={DEFAULT_MODEL}" in example, ".env.example names a different model"
+
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    assert f"MODEL: ${{MODEL:-{DEFAULT_MODEL}}}" in compose, "docker-compose.yml disagrees"
+
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    assert f"`MODEL` | `{DEFAULT_MODEL}`" in readme, "README config table disagrees"
+
+
+@pytest.fixture
+def groq_catalogue(monkeypatch):
+    """Serve a fake `GET /models` without opening a socket."""
+
+    def install(handler) -> None:
+        transport = httpx.MockTransport(handler)
+        original = httpx.AsyncClient
+
+        def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            return original(*args, **{**kwargs, "transport": transport})
+
+        monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+    return install
+
+
+def _catalogue(*model_ids: str):
+    return lambda request: httpx.Response(200, json={"data": [{"id": m} for m in model_ids]})
+
+
+async def test_available_models_lists_what_the_key_can_reach(groq_catalogue):
+    groq_catalogue(_catalogue("qwen/qwen3.8-27b", "openai/gpt-oss-120b"))
+
+    assert await available_models("gsk_fake") == ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]
+
+
+async def test_a_refused_catalogue_yields_no_models(groq_catalogue):
+    groq_catalogue(lambda request: httpx.Response(401, json={"error": "bad key"}))
+
+    assert await available_models("gsk_fake") == []
+
+
+async def test_a_retired_model_is_reported_before_the_run_starts(monkeypatch):
+    """A 404 on the first call is a bad way to learn a model was decommissioned."""
+    monkeypatch.setattr(
+        "deep_research.llm.available_models",
+        AsyncMock(return_value=["qwen/qwen3.8-27b", "openai/gpt-oss-120b"]),
+    )
+    settings = Settings(_env_file=None, groq_api_key="gsk_fake", model="llama-3.3-70b-versatile")
+
+    with pytest.raises(ModelUnavailableError) as caught:
+        await check_model_available(settings)
+
+    message = str(caught.value)
+    assert "llama-3.3-70b-versatile" in message
+    assert "qwen/qwen3.8-27b" in message, "the error should name the models that do work"
+
+
+async def test_an_available_model_passes_the_preflight(monkeypatch):
+    monkeypatch.setattr(
+        "deep_research.llm.available_models", AsyncMock(return_value=["qwen/qwen3.8-27b"])
+    )
+    settings = Settings(_env_file=None, groq_api_key="gsk_fake", model="qwen/qwen3.8-27b")
+
+    assert await check_model_available(settings) == "qwen/qwen3.8-27b"
+
+
+async def test_an_unknown_catalogue_never_blocks_a_run(monkeypatch):
+    """A preflight that can fail a good run is worse than no preflight at all."""
+    monkeypatch.setattr(
+        "deep_research.llm.available_models", AsyncMock(side_effect=httpx.ConnectError("no route"))
+    )
+    settings = Settings(_env_file=None, groq_api_key="gsk_fake", model="qwen/qwen3.8-27b")
+
+    assert await check_model_available(settings) == "qwen/qwen3.8-27b"
+
+
+async def test_a_refused_catalogue_never_blocks_a_run(monkeypatch):
+    monkeypatch.setattr("deep_research.llm.available_models", AsyncMock(return_value=[]))
+    settings = Settings(_env_file=None, groq_api_key="gsk_fake", model="qwen/qwen3.8-27b")
+
+    assert await check_model_available(settings) == "qwen/qwen3.8-27b"
+
+
+async def test_structured_output_uses_a_prompt_template():
+    """Regression: a bare `str` made every live plan and verdict fail silently.
+
+    `astructured_predict` takes a `PromptTemplate`. Passing a string throws
+    inside the call, which `ask_structured` catches, so the run continued on the
+    lenient fallback and a critic that could not be parsed was read as approval.
+    The fake now rejects strings, so this fails if the wrapping is ever removed.
+    """
+    prompt = PLANNER_PROMPT.format(topic="gear wear", min_questions=1, max_questions=1)
+    llm = FakeLLM(plans=[ResearchPlan(questions=["Why do gears wear?"])])
+
+    plan = await ask_structured(llm, ResearchPlan, prompt)
+
+    assert plan is not None
+    assert plan.questions == ["Why do gears wear?"]
+    assert llm.plans_seen == [prompt], "the prompt text must survive the template wrapper"
 
 
 def test_missing_llm_key_is_explained():

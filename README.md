@@ -142,7 +142,38 @@ The notebooks target an earlier LlamaIndex API. Three things had to move:
 | `ctx.get("key")` / `ctx.set("key", v)` | `await ctx.store.get("key", default)` / `await ctx.store.set("key", v)` | `Context.get/set` were removed; state now lives in the typed store. |
 | `Workflow(num_workers=4)` | `@step(num_workers=RESEARCH_WORKERS)` | Concurrency is declared per step, not per workflow. |
 | a step that only calls `send_event` | the step declares the event it produces in its return annotation | The workflow validator now infers step output types from annotations. |
-| OpenAI `gpt-4o` | Groq `llama-3.3-70b-versatile` | Faster, and free-tier friendly. The LLM is created in one place (`llm.py`), so switching back is a one-line change. |
+| OpenAI `gpt-4o` | Groq `qwen/qwen3.8-27b` | Faster, and free-tier friendly. The LLM is created in one place (`llm.py`), so switching back is a one-line change. |
+
+### Choosing a model
+
+The default was picked by testing candidates against the live API, not by
+reading a model list, because "Groq serves it" and "Groq serves it *well enough
+for this pipeline*" are different claims. The pipeline needs three things: a
+planner that reliably fills in a JSON schema, a critic that can reject a weak
+draft, and a token stream fine-grained enough to animate.
+
+| | `qwen/qwen3.8-27b` | `openai/gpt-oss-120b` | `openai/gpt-oss-20b` |
+| --- | --- | --- | --- |
+| Planner schema | works | **fails** | **fails** |
+| Critic can reject | yes | yes | yes |
+| `temperature=0.2` | accepted | accepted | accepted |
+| Reasoning markers in output | none | none | none |
+
+The gpt-oss models reach the critic but fail the planner with
+`tool_use_failed: model did not call a tool` - Groq requires a tool call for
+structured output and they skip it. Since a planner that returns nothing
+collapses to one generic question, that is the wrong trade.
+
+Groq also **retired** `llama-3.3-70b-versatile` while this project was being
+built, so a run died at the first call with a bare `404 model_not_found`.
+Offline tests cannot catch that, because they fake the LLM. So
+`llm.check_model_available` asks Groq what your key can actually reach before a
+run starts and tells you the alternatives:
+
+```
+MODEL=llama-3.3-70b-versatile is not available to your Groq key.
+Available: openai/gpt-oss-120b, qwen/qwen3.8-27b, ... Set MODEL in .env to one of those.
+```
 
 ---
 
@@ -203,7 +234,7 @@ edit, or set the variables in your shell.
 | `SERPER_API_KEY` | — | Required if `SEARCH_PROVIDER=serper`. |
 | `SERPER_BASE_URL` | `https://google.serper.dev` | Override for a proxy or self-hosted Serper. |
 | `SEARCH_PROVIDER` | `tavily` | `tavily`, `serper`, or `none`. `none` forces the local-knowledge path. |
-| `MODEL` | `llama-3.3-70b-versatile` | Any model Groq serves. |
+| `MODEL` | `qwen/qwen3.8-27b` | Any model your Groq key can reach. Checked before a run starts; see below. |
 | `TEMPERATURE` | `0.2` | Low on purpose: this pipeline wants precision, not prose. |
 | `SEARCH_MAX_RESULTS` | `4` | Results per search query. |
 | `MAX_QUESTIONS` | `5` | Upper bound the planner is asked to respect. |

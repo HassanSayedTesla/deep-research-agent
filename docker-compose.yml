@@ -14,7 +14,7 @@ services:
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       SERPER_API_KEY: ${SERPER_API_KEY:-}
       SERPER_BASE_URL: ${SERPER_BASE_URL:-https://google.serper.dev}
-      MODEL: ${MODEL:-llama-3.3-70b-versatile}
+      MODEL: ${MODEL:-qwen/qwen3.8-27b}
       MAX_QUESTIONS: ${MAX_QUESTIONS:-5}
       MAX_REVIEW_CYCLES: ${MAX_REVIEW_CYCLES:-2}
       CONCURRENCY: ${CONCURRENCY:-4}

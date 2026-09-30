@@ -29,7 +29,10 @@ class Settings(BaseSettings):
 
     # --- LLM ---------------------------------------------------------------
     groq_api_key: str = Field(default="", description="API key for Groq.")
-    model: str = Field(default="llama-3.3-70b-versatile", description="Groq model id.")
+    model: str = Field(
+        default="qwen/qwen3.8-27b",
+        description="Groq model id. Checked against your key's model list before a run starts.",
+    )
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
 
     # --- Search ------------------------------------------------------------

@@ -5,6 +5,12 @@ reflection loop, persistence — runs end to end in a test with no network, no
 API keys and no flakiness. They implement only the surface the workflow
 actually calls, which doubles as a check that the workflow stays decoupled from
 any one provider.
+
+They also copy the real signatures, including the parts that are inconvenient.
+`FakeLLM.astructured_predict` insists on a `PromptTemplate` exactly as
+LlamaIndex does, because a laxer fake hides real breakage: a prompt-type
+mismatch once made the entire offline suite green while every live call failed
+and silently degraded.
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from deep_research.schemas import ResearchPlan, ReviewVerdict
+from llama_index.core.prompts.base import BasePromptTemplate
 
 
 @dataclass
@@ -44,14 +51,25 @@ class FakeLLM:
             return None
         return script[min(index, len(script) - 1)]
 
-    async def astructured_predict(self, output_cls: type, prompt: str, **_: Any) -> Any:
+    async def astructured_predict(self, output_cls: type, prompt: Any, **_: Any) -> Any:
+        # Enforce the real LlamaIndex contract. `astructured_predict` declares
+        # `prompt: PromptTemplate`, and handing it a bare `str` fails pydantic
+        # validation before any request goes out. A fake that quietly accepted a
+        # `str` is why that bug reached production: the suite passed while every
+        # live call fell back to lenient parsing.
+        if not isinstance(prompt, BasePromptTemplate):
+            raise TypeError(
+                "astructured_predict needs a PromptTemplate, not "
+                f"{type(prompt).__name__}; wrap it with RichPromptTemplate"
+            )
+        text = prompt.template_str
         if output_cls is ResearchPlan:
-            self.plans_seen.append(prompt)
+            self.plans_seen.append(text)
             scripted = self._next_in(self.plans, self._plan_index)
             self._plan_index += 1
             return scripted if scripted is not None else ResearchPlan(questions=[])
         if output_cls is ReviewVerdict:
-            self.critic_prompts.append(prompt)
+            self.critic_prompts.append(text)
             scripted = self._next_in(self.reviews, self._review_index)
             self._review_index += 1
             return scripted or ReviewVerdict(acceptable=True)
