@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     max_review_cycles: int = Field(
         default=2, ge=0, le=10, description="How many times the critic may force a revision."
     )
+    researcher_max_iterations: int = Field(
+        default=6,
+        ge=2,
+        le=40,
+        description=(
+            "Tool-calling turns one researcher may take. Bounds the agent loop: "
+            "each turn re-sends the system prompt, the tool schema and every "
+            "result gathered so far, so an unbounded researcher can exhaust the "
+            "provider's input budget. On hitting the limit the agent is asked to "
+            "write its answer from what it has rather than raising."
+        ),
+    )
 
     # --- Storage -----------------------------------------------------------
     runs_dir: Path = Field(default=Path("runs"), description="Where finished reports are written.")

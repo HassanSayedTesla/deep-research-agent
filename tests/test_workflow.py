@@ -15,6 +15,7 @@ from deep_research.config import Settings
 from deep_research.events import (
     DONE,
     EDGE_FLOW,
+    LOG,
     NODE_ACTIVATED,
     NODE_FINISHED,
     REPORT_DELTA,
@@ -51,6 +52,50 @@ def make_runner(
         research_agent=agent,
         searcher=searcher,
     )
+
+
+async def test_one_failing_researcher_does_not_lose_the_run(
+    settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent
+):
+    """A dead researcher costs one finding, not the whole run.
+
+    A live run lost 7 minutes of work because a single researcher raised and
+    took the pipeline down with it, even though its sibling had already
+    answered. The report is still worth producing from whatever survived.
+    """
+    agent.fail_on = {2}
+    agent.fail_with = RuntimeError("provider exploded")
+
+    events, result = await drain(make_runner(settings, llm, agent))
+
+    assert result is not None, "the run should finish on partial findings"
+    assert result.meta.status == "ok"
+    assert len(result.meta.questions) == len(QUESTIONS)
+    # The surviving answer is in the report's notes, the dead one is flagged.
+    assert "the answer body" in llm.writer_prompts[0]
+    assert "could not be researched" in llm.writer_prompts[0]
+    # And the operator is told, rather than left to wonder why a question is thin.
+    logs = [e.data.get("msg", "") for e in events_of(events, LOG)]
+    assert any("continuing without it" in msg for msg in logs)
+    assert RUN_FAILED not in kinds(events)
+
+
+async def test_researchers_are_given_a_bounded_agent_loop(
+    settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent
+):
+    """Each researcher must be capped, and capped with a generated stop.
+
+    Unbounded, a researcher whose search budget is spent keeps calling the tool
+    and LlamaIndex aborts the run with "Max iterations of 20 reached".
+    `early_stopping_method="generate"` is what turns that abort into a written
+    answer from the sources gathered so far.
+    """
+    await drain(make_runner(settings, llm, agent))
+
+    assert agent.run_kwargs, "the agent was never called"
+    for kwargs in agent.run_kwargs:
+        assert kwargs["max_iterations"] == settings.researcher_max_iterations
+        assert kwargs["early_stopping_method"] == "generate"
 
 
 async def test_happy_path_produces_and_persists_a_report(

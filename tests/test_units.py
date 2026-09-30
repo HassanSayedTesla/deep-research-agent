@@ -470,6 +470,29 @@ async def test_deps_without_a_gate_still_work(settings: Settings):
         pass
 
 
+async def test_the_spent_search_budget_tells_the_model_to_stop(settings: Settings):
+    """The exhausted-budget reply must end the loop, not invite another call.
+
+    Regression: the message used to read "Answer now using the sources already
+    gathered". A researcher would call the tool again, get the same sentence,
+    and spin until LlamaIndex aborted the whole run. Wording matters here, so
+    the instruction is asserted rather than trusted.
+    """
+    from deep_research.tools.web_search import MAX_SEARCH_CALLS_PER_RUN, WebSearcher
+
+    searcher = WebSearcher(settings, client=StubTavilyClient())
+    allowed = MAX_SEARCH_CALLS_PER_RUN * max(1, settings.max_questions)
+    for _ in range(allowed + 2):
+        await searcher.search("gearbox shock load")
+
+    reply = await searcher._search_uncached("one more")
+
+    assert "budget spent" in reply
+    assert "Do not call this tool again" in reply
+    # The provider was billed at most the allowance; the rest were refusals.
+    assert searcher.calls <= allowed
+
+
 def test_truncating_a_note_keeps_its_links():
     """Regression: a hard cut stripped the sources and the report lost its citations.
 

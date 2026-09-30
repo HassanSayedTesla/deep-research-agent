@@ -196,7 +196,8 @@ class WebSearcher:
         if self.queries > MAX_SEARCH_CALLS_PER_RUN * max(1, self.settings.max_questions):
             return (
                 f"Search budget spent ({self.queries} queries so far). "
-                "Answer now using the sources already gathered, and say if something is unverified."
+                "Do not call this tool again. Write your final answer now using "
+                "the sources already gathered, and say if something is unverified."
             )
 
         self.calls += 1

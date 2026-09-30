@@ -105,14 +105,22 @@ class ScriptedResearchAgent:
     questions: list[str] = field(default_factory=list)
     concurrent_now: int = 0
     max_concurrent: int = 0
+    # kwargs of each run, so a test can assert on how the agent was called.
+    run_kwargs: list[dict[str, Any]] = field(default_factory=list)
+    # Question numbers (1-based) whose run should raise instead of answering.
+    fail_on: set[int] = field(default_factory=set)
+    fail_with: BaseException | None = None
 
-    async def run(self, user_msg: str, **_: Any) -> str:
+    async def run(self, user_msg: str, **kw: Any) -> str:
         self.questions.append(user_msg)
+        self.run_kwargs.append(kw)
         self.concurrent_now += 1
         self.max_concurrent = max(self.max_concurrent, self.concurrent_now)
         try:
             if self.delay:
                 await asyncio.sleep(self.delay)
+            if len(self.questions) in self.fail_on:
+                raise (self.fail_with or RuntimeError("researcher exploded"))
             return f"Finding for question {len(self.questions)}: the answer body."
         finally:
             self.concurrent_now -= 1

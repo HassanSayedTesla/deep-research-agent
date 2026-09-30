@@ -27,6 +27,7 @@ notebook version:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -168,6 +169,24 @@ class ResearchDeps:
 
     async def log(self, message: str) -> None:
         await self.bridge.emit("log", message=message)
+
+
+def _short(exc: BaseException, limit: int = 160) -> str:
+    """A one-line, credential-free description of an exception.
+
+    Provider errors carry request ids and org ids, which are not secrets but are
+    not useful to a reader either, so keep the summary tight.
+    """
+    text = f"{type(exc).__name__}: {exc}".replace("\n", " ").strip()
+    return _truncate(text, limit)
+
+
+def _is_shutdown(exc: BaseException) -> bool:
+    """Is this a cancellation rather than a genuine research failure?"""
+    if isinstance(exc, asyncio.CancelledError):
+        return True
+    name = type(exc).__name__
+    return name in {"WorkflowCancelledError", "CancelledError", "GeneratorExit"}
 
 
 def _looks_truncated(text: str) -> bool:
@@ -321,18 +340,50 @@ class DeepResearchWorkflow(Workflow):
         await deps.node_started(node, detail=ev.question)
         await deps.flow("planner", node, "question", preview=_truncate(ev.question, 120))
 
-        async with deps.llm_slot():
-            result = await with_rate_limit_retry(
-                lambda: deps.research_agent.run(
-                    user_msg=(
-                        f"Research the answer to this question:\n"
-                        f"<question>{ev.question}</question>\n\n"
-                        f"Search the web as often as you need. "
-                        f"Return only the answer itself, with no preamble and no markdown headings."
+        try:
+            async with deps.llm_slot():
+                result = await with_rate_limit_retry(
+                    lambda: deps.research_agent.run(
+                        user_msg=(
+                            f"Research the answer to this question:\n"
+                            f"<question>{ev.question}</question>\n\n"
+                            f"Search the web as often as you need. "
+                            "Return only the answer itself, with no preamble "
+                            "and no markdown headings."
+                        ),
+                        # Bound the tool-calling loop. Left unbounded, a researcher
+                        # keeps searching: once the shared search budget is spent the
+                        # tool only replies "answer now", the model asks again, and
+                        # the pair spins until LlamaIndex aborts the run with
+                        # "Max iterations of 20 reached" - which took down a live run
+                        # that had already produced one good answer. Asking for a
+                        # generated early stop makes the agent write up what it found
+                        # instead of raising.
+                        max_iterations=deps.settings.researcher_max_iterations,
+                        early_stopping_method="generate",
                     )
                 )
+            answer = str(result)
+        except Exception as exc:
+            # One researcher failing should cost one finding, not the run. The
+            # writer still gets the others, and the report says what is missing
+            # rather than disappearing behind an exception. Errors that look like
+            # cancellation (the client hanging up, the run shutting down) are
+            # re-raised so shutdown stays prompt.
+            if isinstance(exc, asyncio.CancelledError) or _is_shutdown(exc):
+                raise
+            logger.warning("researcher %s failed, continuing without it: %s", ev.index, exc)
+            answer = (
+                f"This question could not be researched: {exc}. "
+                f"Answer from your own knowledge, and mark the whole point as unverified."
             )
-        answer = str(result)
+            await deps.bridge.emit(
+                "log",
+                msg=f"Researcher {ev.index + 1} failed ({_short(exc)}); continuing without it.",
+            )
+            ctx.write_event_to_stream(
+                ProgressEvent(msg=f"Researcher {ev.index + 1} failed; continuing without it.")
+            )
 
         await deps.node_finished(node, summary=_truncate(answer, 140))
         await deps.flow(node, "writer", "finding", preview=_truncate(answer, 140))
