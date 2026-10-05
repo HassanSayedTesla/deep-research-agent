@@ -48,8 +48,10 @@ from deep_research.llm import (
     available_models,
     build_llm,
     check_model_available,
+    is_auth_error,
     is_quota_error,
     is_retryable,
+    provider_failure_note,
     with_rate_limit_retry,
 )
 from deep_research.prompts import PLANNER_PROMPT
@@ -665,6 +667,32 @@ async def test_a_daily_budget_fails_fast_instead_of_retrying():
         await with_rate_limit_retry(always_denied, base_delay=0.0)
 
     assert attempts["n"] == 1, "a dead daily budget should not be retried"
+
+
+def test_provider_failure_note_distinguishes_auth_quota_and_generic():
+    """A present key can still be rejected, so the finding must say which failure it was.
+
+    Streamlit showed no missing secrets and Groq still answered 403. Reporting
+    that as a generic provider error sends the operator back to the secrets
+    page they already completed; reporting it as rejected credentials points at
+    the key, organization, or network policy instead.
+    """
+    from openai import PermissionDeniedError
+
+    rejected = PermissionDeniedError(
+        "Access denied. Please check your network settings.",
+        response=httpx.Response(403, request=httpx.Request("POST", "https://x")),
+        body=None,
+    )
+    exhausted = _groq_429(
+        "Rate limit reached ... on tokens per day (TPD): Limit 200000, Used 199601."
+    )
+
+    assert is_auth_error(rejected)
+    assert not is_auth_error(exhausted)
+    assert provider_failure_note(rejected) == "the provider rejected the configured API key"
+    assert provider_failure_note(exhausted) == "the provider's quota was exhausted"
+    assert provider_failure_note(RuntimeError("boom")) == "the provider returned RuntimeError"
 
 
 def test_truncating_a_note_keeps_its_links():

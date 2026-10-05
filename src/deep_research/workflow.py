@@ -53,6 +53,7 @@ from .llm import (
     ask_structured,
     build_llm,
     is_quota_error,
+    provider_failure_note,
     settings_override,
     with_rate_limit_retry,
 )
@@ -512,14 +513,11 @@ class DeepResearchWorkflow(Workflow):
             #
             # Truncating it was not enough: the first 90 characters still carried
             # the account id. So the note says what kind of failure it was and
-            # nothing else - the reader needs to know the question went unanswered
-            # and that nothing in it is verified. The detail belongs in the log,
-            # where `logger.warning` above already recorded all of it.
-            reason = (
-                "the provider's quota was exhausted"
-                if is_quota_error(exc)
-                else f"the provider returned {type(exc).__name__}"
-            )
+            # nothing else - rejected credentials, exhausted quota, or another
+            # provider error. The reader needs to know the question went
+            # unanswered and that nothing in it is verified. The detail belongs
+            # in the log, where `logger.warning` above already recorded all of it.
+            reason = provider_failure_note(exc)
             answer = (
                 f"This question could not be researched: {reason}. Treat the whole "
                 "point as unverified, answer from your own knowledge if you can, and "

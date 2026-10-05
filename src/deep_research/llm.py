@@ -200,6 +200,39 @@ def is_quota_error(exc: Exception) -> bool:
     return status == 429 or "RateLimit" in type(exc).__name__ or "rate_limit" in str(exc).lower()
 
 
+def is_auth_error(exc: Exception) -> bool:
+    """Did the provider reject the call because of credentials or access?
+
+    A key can be present but still invalid, revoked, scoped to another
+    organization, or blocked by network policy. Groq reports this as 401/403,
+    while the SDK may surface it as `PermissionDeniedError` or
+    `AuthenticationError`.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 401 or status == 403:
+        return True
+    text = f"{type(exc).__name__} {exc}".lower()
+    markers = (
+        "permissiondenied",
+        "authentication",
+        "unauthorized",
+        "forbidden",
+        "access denied",
+        "invalid api key",
+        "incorrect api key",
+    )
+    return any(marker in text for marker in markers)
+
+
+def provider_failure_note(exc: Exception) -> str:
+    """Reader-safe category for a provider failure, without provider details."""
+    if is_auth_error(exc):
+        return "the provider rejected the configured API key"
+    if is_quota_error(exc):
+        return "the provider's quota was exhausted"
+    return f"the provider returned {type(exc).__name__}"
+
+
 def is_retryable(exc: Exception) -> bool:
     """Would waiting plausibly let this call succeed?
 
