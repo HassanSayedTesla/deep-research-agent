@@ -161,10 +161,10 @@ def test_streamlit_secrets_map_to_settings(monkeypatch):
 
     configured = settings_from_secrets(
         {
-            "GROQ_API_KEY": "gsk-test",
+            "GROQ_API_KEY": "gsk-test\n",
             "deep_research": {
                 "search_provider": "tavily",
-                "tavily_api_key": "tvly-test",
+                "tavily_api_key": "  tvly-test  ",
                 "dashboard_only": "ignored",
             },
         },
@@ -690,7 +690,9 @@ def test_provider_failure_note_distinguishes_auth_quota_and_generic():
 
     assert is_auth_error(rejected)
     assert not is_auth_error(exhausted)
-    assert provider_failure_note(rejected) == "the provider rejected the configured API key"
+    assert provider_failure_note(rejected) == (
+        "the provider rejected the configured API key (HTTP 403)"
+    )
     assert provider_failure_note(exhausted) == "the provider's quota was exhausted"
     assert provider_failure_note(RuntimeError("boom")) == "the provider returned RuntimeError"
 

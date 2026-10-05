@@ -56,6 +56,10 @@ def settings_from_secrets(secrets: Mapping[str, Any], base: Settings | None = No
     known = {name.lower(): name for name in Settings.model_fields}
     overrides: dict[str, Any] = {}
     for key, value in _flattened_secrets(secrets).items():
+        # Dashboard pastes often carry a trailing newline or space. A key with
+        # invisible whitespace is present but invalid, and Groq answers 403.
+        if isinstance(value, str):
+            value = value.strip()
         for candidate in _candidate_names(key):
             if candidate in known:
                 overrides[known[candidate]] = value

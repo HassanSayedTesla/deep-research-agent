@@ -226,8 +226,10 @@ def is_auth_error(exc: Exception) -> bool:
 
 def provider_failure_note(exc: Exception) -> str:
     """Reader-safe category for a provider failure, without provider details."""
+    status = getattr(exc, "status_code", None)
+    suffix = f" (HTTP {status})" if isinstance(status, int) else ""
     if is_auth_error(exc):
-        return "the provider rejected the configured API key"
+        return f"the provider rejected the configured API key{suffix}"
     if is_quota_error(exc):
         return "the provider's quota was exhausted"
     return f"the provider returned {type(exc).__name__}"
