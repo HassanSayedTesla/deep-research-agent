@@ -727,6 +727,49 @@ def test_a_short_note_is_untouched():
     assert _truncate_notes(note) == note
 
 
+def test_placeholder_citations_are_stripped_but_real_links_survive():
+    """A `#` target is never evidence, so the whole fake link must go.
+
+    A live briefing claimed that no sources were retrieved and then cited
+    `[what the source says](#)` twice. Removing only the parentheses would leave
+    a dangling claim; removing the link preserves the sentence while deleting
+    the fabricated evidence.
+    """
+    from deep_research.workflow import _strip_placeholder_citations
+
+    text = (
+        "Power factor is unpaid capacity [what the source says](#), "
+        "and also [nothing]() while Boston University says otherwise "
+        "([Mechanics of Materials](https://www.bu.edu/moss/mechanics-of-materials-stress))."
+    )
+
+    cleaned = _strip_placeholder_citations(text)
+
+    assert "(#)" not in cleaned
+    assert "what the source says" not in cleaned
+    assert "Power factor is unpaid capacity" in cleaned
+    assert "https://www.bu.edu/moss/mechanics-of-materials-stress" in cleaned
+
+
+def test_prompts_forbid_placeholder_citations():
+    """The old citation example taught the model its own failure mode.
+
+    Both prompts literally showed `[what the source says](url)`. A writer with
+    no sources then reproduced the anchor text and pointed it at `#`. The
+    prompts must now forbid invented, missing, and `#` targets explicitly.
+    """
+    from deep_research.prompts import CRITIC_PROMPT, RESEARCHER_PROMPT, WRITER_PROMPT
+
+    assert "](url)" not in RESEARCHER_PROMPT
+    assert "](url)" not in WRITER_PROMPT
+    for prompt in (RESEARCHER_PROMPT, WRITER_PROMPT):
+        assert "Never invent" in prompt
+        assert "`#`" in prompt
+    assert "write no citations" in RESEARCHER_PROMPT
+    assert "no verified sources" in WRITER_PROMPT
+    assert "no verified sources" in " ".join(CRITIC_PROMPT.split())
+
+
 async def test_an_unreachable_critic_is_not_recorded_as_approval(monkeypatch, settings: Settings):
     """The silent-approval trap, closed.
 

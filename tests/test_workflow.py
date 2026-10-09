@@ -201,6 +201,32 @@ async def test_a_cancelled_researcher_is_not_reported_as_a_failed_one(
     )
 
 
+async def test_a_draft_with_placeholder_citations_is_sanitized_before_it_ships(
+    settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent
+):
+    """The persisted report must not preserve a fake citation.
+
+    A live briefing said that no sources were retrieved and then cited
+    `[what the source says](#)` twice. Prompt wording alone cannot guarantee
+    obedience, so the workflow strips `#`/empty targets after the writer runs
+    while leaving real links untouched.
+    """
+    llm.report = (
+        "# Report\n\nPower factor matters [what the source says](#), "
+        "but see [a real source](https://example.com/power-factor)."
+    )
+
+    events, result = await drain(make_runner(settings, llm, agent))
+
+    assert result is not None
+    assert "(#)" not in result.report
+    assert "what the source says" not in result.report
+    assert "https://example.com/power-factor" in result.report
+    logs = [e.data.get("msg", "") for e in events_of(events, LOG)]
+    assert any("placeholder citations" in msg for msg in logs)
+    assert RUN_FAILED not in kinds(events)
+
+
 async def test_a_truncated_draft_is_rewritten_at_a_larger_cap(
     settings: Settings, llm: FakeLLM, agent: ScriptedResearchAgent, monkeypatch
 ):

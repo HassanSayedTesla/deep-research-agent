@@ -55,12 +55,11 @@ Rules:
   sources agree before you state a contested fact.
 - Prefer specifics: numbers, dates, names, mechanisms.
 - State plainly when the evidence is thin or the sources disagree.
-- Keep the source links. Write each claim as `text ([what the source says](url))`
-  using the URLs the tool returned. This is the part that matters most: your
-  answer is the only place the writer can learn where the evidence came from, so
-  an answer without links becomes a report nobody can check. A live run produced
-  a 2,500-character briefing with zero citations because every researcher
-  dropped its links.
+- Keep source links by copying each complete markdown link exactly as the tool
+  returned it. Never invent, shorten, complete, or guess a URL, and never emit
+  a link whose target is missing or `#`.
+- If the tool returned no usable links, say so plainly and write no citations
+  at all. A generic anchor on an empty or missing link is not a citation.
 - Reply with the answer only. No preamble, no headings, no markdown."""
 
 WRITER_PROMPT = """You are the writing stage of an automated deep-research system.
@@ -74,11 +73,16 @@ Rules:
 - Use headings and short paragraphs. Use bullets for genuinely enumerable
   items such as options, specs or steps.
 - Where the notes disagree or are thin, say so rather than papering over it.
-- Cite sources inline as markdown links, at the end of the sentence they support:
-  a claim about service factors needs `[what the source says](url)`. The notes
-  carry these links; keep them. A research briefing with no links cannot be
-  checked by the reader, so an uncited report counts as a failed one.
-- Close with a "## Sources" section listing each distinct link you cited.
+- Cite sources inline as markdown links, at the end of the sentence they support,
+  by copying only complete links already present in the notes. Never invent a
+  fact, figure, citation, section, URL, or link target the notes do not support.
+  Never emit a link to `#`, an empty target, or a URL absent from the notes.
+  If the notes contain no usable source links, write no inline citations and no
+  Sources section; say explicitly that no verified sources were retrieved.
+  A research briefing with no links cannot be checked by the reader, so
+  source-backed claims without real citations count as a failed report.
+- Close with a "## Sources" section only when you actually cited real links,
+  listing each distinct link you cited.
 - Do not invent facts, figures, citations or sections that the notes do not
   support. Never cite a link the notes did not give you.
 - Aim for substance over length: no filler, no restating the question.
@@ -96,7 +100,11 @@ You will be given a draft briefing. Decide whether it is comprehensive enough
 to ship, given the research notes it was built from.
 
 Set `acceptable` to true only if the draft covers the topic's main angles, is
-grounded in the notes, and is not padded with unsupported claims.
+grounded in the notes, and is not padded with unsupported claims. A draft is
+not acceptable if it contains a markdown link to `#`, an empty link target, a
+URL absent from the notes, or source-backed claims with no real citations. When
+the notes contain no usable links, accept only a draft that explicitly says no
+verified sources were retrieved and contains no citations.
 
 If it is not acceptable, set `acceptable` to false and write specific, actionable
 `feedback`: name the gap and say what should be researched to close it. "Add

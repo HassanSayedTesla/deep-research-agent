@@ -215,10 +215,17 @@ def _assemble_report(topic: str, findings: list[FindingEvent]) -> str:
         f"# {topic}",
         "",
         "> **Unprocessed research notes.** The writing stage could not run, so this "
-        "is the research output assembled directly: accurate and cited, but not "
-        "edited into a briefing.",
+        "is the research output assembled directly: unedited, and unverified "
+        "wherever the notes say so.",
         "",
     ]
+    if not re.search(r"https?://", "\n".join(finding.answer for finding in findings)):
+        lines.extend(
+            [
+                "> No verified sources were retrieved for this run.",
+                "",
+            ]
+        )
     for finding in findings:
         lines.append(f"## {finding.question}")
         lines.append("")
@@ -316,6 +323,23 @@ def _looks_truncated(text: str) -> bool:
     if stripped.rsplit("\n", 1)[-1].startswith("#"):
         return True
     return False
+
+
+_PLACEHOLDER_LINK_RE = re.compile(r"\[[^\]]*\]\(\s*(?:#[^)]*)?\s*\)")
+
+
+def _strip_placeholder_citations(text: str) -> str:
+    """Remove markdown links that cannot possibly be sources.
+
+    A live writer obeyed the old citation example too literally and emitted
+    `[what the source says](#)` after claiming that no sources were retrieved.
+    A `#` or empty target is never evidence, so remove the whole link rather
+    than trusting the model not to invent one. Real `http(s)` links pass through
+    untouched.
+    """
+    cleaned = _PLACEHOLDER_LINK_RE.sub("", text)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _truncate(text: str, limit: int = MAX_NOTE_CHARS) -> str:
@@ -663,6 +687,18 @@ class DeepResearchWorkflow(Workflow):
                         "report is the raw research notes assembled directly."
                     ),
                 )
+
+        # A model can still disobey the prompt and emit `[text](#)` after saying
+        # that no sources were retrieved. The streamed tokens may already have
+        # shown it, but the persisted report must not preserve a fake citation.
+        sanitized = _strip_placeholder_citations(draft)
+        if sanitized != draft:
+            logger.warning("removed placeholder citations from the writer's draft")
+            await deps.bridge.emit(
+                "log",
+                msg="Removed placeholder citations from the draft; they were not real sources.",
+            )
+            draft = sanitized
 
         # L1: only blame the token cap when the cap is what actually stopped the
         # writer. Reporting a healthy report as truncated - and advising the
